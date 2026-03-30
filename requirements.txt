@@ -1,0 +1,31 @@
+# ==============================
+# OSAT SPC System - Requirements
+# Python >= 3.10
+# ==============================
+
+# --- Web Framework ---
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.8.2
+
+# --- Data & Math ---
+pandas==2.2.2
+numpy==2.0.2
+scipy==1.13.1
+statsmodels==0.14.2
+
+# --- Plotting ---
+matplotlib==3.9.2
+
+# --- Excel I/O ---
+openpyxl==3.1.5
+xlsxwriter==3.2.0
+
+# --- Image ---
+Pillow==10.4.0
+
+# --- Frontend ---
+streamlit==1.28.0
+
+# --- HTTP Client (Streamlit -> FastAPI) ---
+requests==2.31.0
