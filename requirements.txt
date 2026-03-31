@@ -16,6 +16,7 @@ statsmodels==0.14.2
 
 # --- Plotting ---
 matplotlib==3.9.2
+plotly>=5.18.0
 
 # --- Excel I/O ---
 openpyxl==3.1.5

@@ -8,6 +8,7 @@ import uuid
 import io
 import xlsxwriter
 import hashlib
+import plotly.graph_objects as go
 from PIL import Image
 from datetime import datetime
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
@@ -121,8 +122,10 @@ def _local_split_vendor_vertical(input_path: str, out_dir: str) -> bool:
     try:
         print(f"[LocalSplit][Vendor_Vertical] 讀取檔案: {os.path.basename(input_path)}")
         df = _local_read_csv(input_path, header_val="infer")
-        col_map = {"Part ID": "GroupName", "Item Name": "ChartName", "Report Time": "point_time", "Lot Mean": "point_val", "Vendor Site": "Matching"}
-        missing = [k for k in col_map if k not in df.columns]
+        lot_mean_col = "Lot Mean Valid" if "Lot Mean Valid" in df.columns else "Lot Mean"
+        col_map = {"Part ID": "GroupName", "Item Name": "ChartName", "Report Time": "point_time", lot_mean_col: "point_val", "Vendor Site": "Matching"}
+        required = ["Part ID", "Item Name", "Report Time", lot_mean_col, "Vendor Site"]
+        missing = [k for k in required if k not in df.columns]
         if missing:
             raise ValueError(f"Missing vendor columns: {missing}")
         df = df.rename(columns=col_map)
@@ -368,7 +371,7 @@ def generate_full_excel_with_images(data_list, mode):
     cell_format = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'font_name': 'Arial', 'font_size': 10})
 
     # 決定要排除的欄位 (圖片路徑不需要顯示為文字)
-    exclude_cols = ['chart_path', 'weekly_chart_path', 'by_tool_color_path', 'by_tool_group_path', 'qq_plot_path', 'chart_image', 'spc_chart_path', 'boxplot_chart_path', 'timeline_chart_path']
+    exclude_cols = ['chart_path', 'weekly_chart_path', 'by_tool_color_path', 'by_tool_group_path', 'qq_plot_path', 'chart_image', 'spc_chart_path', 'boxplot_chart_path', 'timeline_chart_path', 'chart_data']
     data_cols = [c for c in df.columns if c not in exclude_cols]
 
     is_oob_mode = mode == "OOB/SPC"
@@ -591,7 +594,7 @@ with col1:
                     detected_cols = set(peek.columns)
                     detected_split_mode = None
                     
-                    if {"Part ID", "Item Name", "Report Time", "Lot Mean", "Vendor Site"}.issubset(detected_cols):
+                    if {"Part ID", "Item Name", "Report Time", "Vendor Site"}.issubset(detected_cols) and ("Lot Mean" in detected_cols or "Lot Mean Valid" in detected_cols):
                         detected_split_mode = "Vendor_Vertical"
                     elif {"Part ID", "FT Test End Time", "Test Site"}.issubset(detected_cols):
                         detected_split_mode = "Test_Horizontal"
@@ -631,6 +634,7 @@ with col1:
             payload = {}
             if mode == "OOB/SPC":
                 endpoint = "/process"
+                payload["base_date"] = base_date.strftime("%Y-%m-%d")
                 if current_excel_path: payload["filepath"] = current_excel_path
                 if auto_split_raw_dir: payload["raw_data_directory"] = auto_split_raw_dir
                 elif current_raw_dir: payload["raw_data_directory"] = current_raw_dir
@@ -884,7 +888,237 @@ if st.session_state.results:
                 if st.session_state.current_mode == "OOB/SPC":
                     if item.get('chart_path'):
                         st.markdown(f"**All Data SPC - {item.get('chart_name')}**")
-                        st.image(item['chart_path'], use_container_width=True)
+                        chart_data = item.get('chart_data')
+                        if chart_data:
+                            try:
+                                _SITE_COLORS = [
+                                    '#5863F8','#E83F6F','#087E8B','#FF6B35','#4CC9F0',
+                                    '#7209B7','#F72585','#3A0CA3','#FBBF24','#10B981',
+                                ]
+
+                                df_pts = pd.DataFrame(chart_data)
+                                df_pts['point_val'] = pd.to_numeric(df_pts['point_val'], errors='coerce')
+                                df_pts = df_pts.dropna(subset=['point_val'])
+                                df_pts = df_pts.sort_values('point_time').reset_index(drop=True)
+
+                                fig = go.Figure()
+
+                                # --- 背景底色：Baseline(藍) vs Weekly(紅) ---
+                                _wk_start = item.get('weekly_start')
+                                _wk_end   = item.get('weekly_end')
+                                if _wk_start and _wk_end and not df_pts.empty:
+                                    _x_min = df_pts['point_time'].iloc[0]
+                                    _x_max = df_pts['point_time'].iloc[-1]
+                                    fig.add_vrect(
+                                        x0=_x_min, x1=_wk_start,
+                                        fillcolor='rgba(55,114,255,0.08)',
+                                        layer='below', line_width=0,
+                                    )
+                                    fig.add_vrect(
+                                        x0=_wk_start, x1=_x_max,
+                                        fillcolor='rgba(232,63,111,0.10)',
+                                        layer='below', line_width=0,
+                                    )
+
+                                # --- 資料線（依 Site 分組上色）---
+                                if 'Matching' in df_pts.columns:
+                                    _sites = sorted(df_pts['Matching'].astype(str).unique())
+                                    for _idx, _site in enumerate(_sites):
+                                        _grp = df_pts[df_pts['Matching'].astype(str) == _site]
+                                        _color = _SITE_COLORS[_idx % len(_SITE_COLORS)]
+                                        fig.add_trace(go.Scatter(
+                                            x=_grp['point_time'],
+                                            y=_grp['point_val'],
+                                            mode='markers+lines',
+                                            name=str(_site),
+                                            line=dict(width=1.2, color=_color),
+                                            marker=dict(size=5, color=_color,
+                                                        line=dict(width=0.5, color='white')),
+                                            hovertemplate=(
+                                                '<b>%{fullData.name}</b><br>'
+                                                '時間: %{x}<br>'
+                                                '數值: %{y:.4g}'
+                                                '<extra></extra>'
+                                            ),
+                                        ))
+                                else:
+                                    fig.add_trace(go.Scatter(
+                                        x=df_pts['point_time'],
+                                        y=df_pts['point_val'],
+                                        mode='markers+lines',
+                                        name='Data',
+                                        line=dict(width=1.5, color='#5863F8'),
+                                        marker=dict(size=5, color='#5863F8',
+                                                    line=dict(width=0.5, color='white')),
+                                        hovertemplate='時間: %{x}<br>數值: %{y:.4g}<extra></extra>',
+                                    ))
+
+                                # --- 控制線 ---
+                                def _safe_float(v):
+                                    try:
+                                        f = float(v)
+                                        return None if (f != f) else f
+                                    except (TypeError, ValueError):
+                                        return None
+
+                                _ucl_v = _safe_float(item.get('UCL'))
+                                _lcl_v = _safe_float(item.get('LCL'))
+
+                                # --- 當週資料子集（用於違規標記）---
+                                if _wk_start and _wk_end and not df_pts.empty:
+                                    _df_wk = df_pts[
+                                        (df_pts['point_time'] >= _wk_start) &
+                                        (df_pts['point_time'] <= _wk_end)
+                                    ].copy()
+                                else:
+                                    _df_wk = df_pts.copy()
+
+                                # WE1：當週點 > UCL
+                                if _ucl_v is not None and not _df_wk.empty:
+                                    _we1 = _df_wk[_df_wk['point_val'] > _ucl_v]
+                                    if not _we1.empty:
+                                        fig.add_trace(go.Scatter(
+                                            x=_we1['point_time'], y=_we1['point_val'],
+                                            mode='markers', name='WE1 (>UCL)',
+                                            marker=dict(symbol='circle-open', size=16,
+                                                        color='#E83F6F',
+                                                        line=dict(width=2.5, color='#E83F6F')),
+                                            hovertemplate=(
+                                                '<b style="color:#E83F6F">⚠ WE1 違規</b><br>'
+                                                '時間: %{x}<br>數值: %{y:.4g}'
+                                                '<extra></extra>'
+                                            ),
+                                        ))
+
+                                # WE5：當週點 < LCL
+                                if _lcl_v is not None and not _df_wk.empty:
+                                    _we5 = _df_wk[_df_wk['point_val'] < _lcl_v]
+                                    if not _we5.empty:
+                                        fig.add_trace(go.Scatter(
+                                            x=_we5['point_time'], y=_we5['point_val'],
+                                            mode='markers', name='WE5 (<LCL)',
+                                            marker=dict(symbol='circle-open', size=16,
+                                                        color='#E83F6F',
+                                                        line=dict(width=2.5, color='#E83F6F')),
+                                            hovertemplate=(
+                                                '<b style="color:#E83F6F">⚠ WE5 違規</b><br>'
+                                                '時間: %{x}<br>數值: %{y:.4g}'
+                                                '<extra></extra>'
+                                            ),
+                                        ))
+
+                                # Record High：當週最高點（若本週創歷史新高）
+                                if item.get('record_high') and not _df_wk.empty:
+                                    _rh_val = _df_wk['point_val'].max()
+                                    _rh_pts = _df_wk[_df_wk['point_val'] == _rh_val]
+                                    fig.add_trace(go.Scatter(
+                                        x=_rh_pts['point_time'], y=_rh_pts['point_val'],
+                                        mode='markers', name='Record High ★',
+                                        marker=dict(symbol='star', size=14,
+                                                    color='#FBBF24',
+                                                    line=dict(width=1, color='#D97706')),
+                                        hovertemplate=(
+                                            '<b style="color:#D97706">★ Record High</b><br>'
+                                            '時間: %{x}<br>數值: %{y:.4g}'
+                                            '<extra></extra>'
+                                        ),
+                                    ))
+
+                                # Record Low：當週最低點（若本週創歷史新低）
+                                if item.get('record_low') and not _df_wk.empty:
+                                    _rl_val = _df_wk['point_val'].min()
+                                    _rl_pts = _df_wk[_df_wk['point_val'] == _rl_val]
+                                    fig.add_trace(go.Scatter(
+                                        x=_rl_pts['point_time'], y=_rl_pts['point_val'],
+                                        mode='markers', name='Record Low ★',
+                                        marker=dict(symbol='star', size=14,
+                                                    color='#4CC9F0',
+                                                    line=dict(width=1, color='#0284C7')),
+                                        hovertemplate=(
+                                            '<b style="color:#0284C7">★ Record Low</b><br>'
+                                            '時間: %{x}<br>數值: %{y:.4g}'
+                                            '<extra></extra>'
+                                        ),
+                                    ))
+
+                                for _val, _color, _label, _dash in [
+                                    (_safe_float(item.get('UCL')),    '#E83F6F', 'UCL',    'dash'),
+                                    (_safe_float(item.get('LCL')),    '#E83F6F', 'LCL',    'dash'),
+                                    (_safe_float(item.get('Target')), '#087E8B', 'Target', 'dot'),
+                                    (_safe_float(item.get('USL')),    '#FF6B35', 'USL',    'dashdot'),
+                                    (_safe_float(item.get('LSL')),    '#FF6B35', 'LSL',    'dashdot'),
+                                ]:
+                                    if _val is not None:
+                                        fig.add_hline(
+                                            y=_val,
+                                            line_dash=_dash,
+                                            line_color=_color,
+                                            line_width=1.2,
+                                            annotation_text=f'<b>{_label}</b>: {_val:.4g}',
+                                            annotation_position='right',
+                                            annotation_font_size=10,
+                                            annotation_font_color=_color,
+                                            annotation_bgcolor='rgba(255,255,255,0.75)',
+                                        )
+
+                                # --- 標題（含控制線數值）---
+                                _ucl = _safe_float(item.get('UCL'))
+                                _lcl = _safe_float(item.get('LCL'))
+                                _tgt = _safe_float(item.get('Target'))
+                                _sub = '  |  '.join([
+                                    p for p in [
+                                        f"UCL: {_ucl:.4g}" if _ucl is not None else None,
+                                        f"Target: {_tgt:.4g}" if _tgt is not None else None,
+                                        f"LCL: {_lcl:.4g}" if _lcl is not None else None,
+                                    ] if p
+                                ])
+                                _title_text = f"<b>{item.get('chart_name', '')}</b>"
+                                if _sub:
+                                    _title_text += f"<br><span style='font-size:11px;color:#444'>{_sub}</span>"
+
+                                fig.update_layout(
+                                    height=390,
+                                    margin=dict(l=10, r=90, t=50, b=55),
+                                    title=dict(
+                                        text=_title_text,
+                                        font=dict(size=13, color='#1a1a1a'),
+                                        x=0, xanchor='left',
+                                        pad=dict(l=5),
+                                    ),
+                                    legend=dict(
+                                        orientation='h',
+                                        yanchor='bottom', y=1.02,
+                                        xanchor='right', x=1,
+                                        font=dict(size=10, color='#222'),
+                                        bgcolor='rgba(255,255,255,0.9)',
+                                        bordercolor='rgba(150,150,150,0.6)',
+                                        borderwidth=1,
+                                    ),
+                                    hovermode='closest',
+                                    plot_bgcolor='white',
+                                    paper_bgcolor='white',
+                                    font=dict(color='#222'),
+                                )
+                                fig.update_xaxes(
+                                    showgrid=False, gridcolor='rgba(0,0,0,0.10)',
+                                    tickangle=-90,
+                                    tickformat='%Y-%m-%d',
+                                    nticks=20,
+                                    tickfont=dict(size=9, color='#333'),
+                                    showline=True, linecolor='rgba(0,0,0,0.30)',
+                                    zeroline=False,
+                                )
+                                fig.update_yaxes(
+                                    showgrid=False, gridcolor='rgba(0,0,0,0.10)',
+                                    tickfont=dict(size=10, color='#333'),
+                                    showline=True, linecolor='rgba(0,0,0,0.20)',
+                                    zeroline=False,
+                                )
+                                st.plotly_chart(fig, use_container_width=True)
+                            except Exception:
+                                st.image(item['chart_path'], use_container_width=True)
+                        else:
+                            st.image(item['chart_path'], use_container_width=True)
                     else:
                         st.info("無主圖資料")
                 elif st.session_state.current_mode == "CPK Dashboard" and item.get('chart_image'):

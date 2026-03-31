@@ -3332,6 +3332,22 @@ class SPCApp(QtWidgets.QMainWindow): # 將 QTabWidget 改為 QMainWindow
             cpk_result = calculate_cpk(weekly_data, chart_info)
             result['Cpk'] = cpk_result.get('Cpk', np.nan) if cpk_result else np.nan
 
+            # 序列化 chart_data 供 UI Plotly hover 使用 (All Data SPC)
+            try:
+                _plot_cols = ['point_time', 'point_val']
+                if 'Matching' in raw_df.columns:
+                    _plot_cols.append('Matching')
+                _plot_df = raw_df[_plot_cols].copy()
+                _plot_df['point_time'] = _plot_df['point_time'].astype(str)
+                _plot_df['point_val'] = pd.to_numeric(_plot_df['point_val'], errors='coerce')
+                _plot_df = _plot_df.dropna(subset=['point_val'])
+                if 'Matching' in _plot_df.columns:
+                    _plot_df['Matching'] = _plot_df['Matching'].fillna('Unknown').astype(str)
+                result['chart_data'] = _plot_df.to_dict(orient='records')
+            except Exception as _chart_data_err:
+                print(f" - analyze_chart: chart_data 序列化失敗 ({_chart_data_err})，略過")
+                result['chart_data'] = []
+
             # 更新結果
             result['violated_rules'] = violated_rules if violated_rules is not None else {}
             self.build_result(result, image_path, weekly_image_path)

@@ -156,6 +156,7 @@ class ProcessRequest(BaseModel):
     save_excel: bool = Field(default=True, description="Save Excel report with images")
     scale_factor: float = Field(default=0.3, description="Image scale factor in Excel")
     limit_charts: Optional[int] = Field(default=None, description="Limit number of charts to process")
+    base_date: Optional[str] = Field(default=None, description="Analysis base date (YYYY-MM-DD); used as weekly_end_date")
 
 class ProcessSummary(BaseModel):
     total_charts: int
@@ -189,6 +190,9 @@ class ResultItem(BaseModel):
     by_tool_color_path: Optional[str] = None
     by_tool_group_path: Optional[str] = None
     qq_plot_path: Optional[str] = None
+    chart_data: Optional[List[Dict[str, Any]]] = None
+    weekly_start: Optional[str] = None
+    weekly_end: Optional[str] = None
 
 class ProcessResponse(BaseModel):
     summary: ProcessSummary
@@ -423,15 +427,17 @@ def _split_type2_vertical(input_path: str, final_output_folder: str) -> bool:
 def _split_vendor_vertical(input_path: str, final_output_folder: str) -> bool:
     try:
         df = _read_csv_with_encoding_fallback(input_path, header_val="infer")
-        # 欄位對應：廠商格式 -> 標準格式
+        # 欄位對應：廠商格式 -> 標準格式（Lot Mean / Lot Mean Valid 均相容）
+        lot_mean_col = "Lot Mean Valid" if "Lot Mean Valid" in df.columns else "Lot Mean"
         vendor_col_map = {
             "Part ID":     "GroupName",
             "Item Name":   "ChartName",
             "Report Time": "point_time",
-            "Lot Mean":    "point_val",
+            lot_mean_col:  "point_val",
             "Vendor Site": "Matching",
         }
-        missing = [src for src in vendor_col_map if src not in df.columns]
+        required_cols = ["Part ID", "Item Name", "Report Time", lot_mean_col, "Vendor Site"]
+        missing = [src for src in required_cols if src not in df.columns]
         if missing:
             raise ValueError(f"Missing required vendor columns: {', '.join(missing)}")
         df = df.rename(columns=vendor_col_map)
@@ -720,6 +726,30 @@ def _analyze_chart_api(execution_time: Optional[pd.Timestamp], raw_df: pd.DataFr
         qq_plot_path = plot_qq_plot(raw_df, chart_info, output_dir=output_dir)
     except Exception:
         qq_plot_path = None
+
+    # 序列化 chart_data 供 UI Plotly hover 使用 (All Data SPC)
+    result["weekly_start"] = str(weekly_start_date)
+    result["weekly_end"]   = str(weekly_end_date)
+    try:
+        _possible_site_cols = ["Matching", "ByTool", "EQP_id", "Tool", "tool_id", "Vendor_Site"]
+        _site_col = next((c for c in _possible_site_cols if c in raw_df.columns), None)
+        _plot_cols = ["point_time", "point_val"]
+        if _site_col:
+            _plot_cols.append(_site_col)
+        _plot_df = raw_df[_plot_cols].copy()
+        _plot_df["point_time"] = _plot_df["point_time"].astype(str)
+        _plot_df["point_val"] = pd.to_numeric(_plot_df["point_val"], errors="coerce")
+        _plot_df = _plot_df.dropna(subset=["point_val"])
+        if _site_col:
+            _plot_df = _plot_df.rename(columns={_site_col: "Matching"})
+            _plot_df["Matching"] = _plot_df["Matching"].fillna("Unknown").astype(str)
+        # 確保所有值都是 Python 原生型別（避免 numpy 型別造成 JSON 序列化問題）
+        result["chart_data"] = [
+            {k: (float(v) if hasattr(v, "item") else v) for k, v in row.items()}
+            for row in _plot_df.to_dict(orient="records")
+        ]
+    except Exception:
+        result["chart_data"] = []
 
     return _build_result_api(result, violated_rules, image_path, weekly_image_path, qq_plot_path)
 
@@ -1270,7 +1300,10 @@ def _run_process_task(task_id: str, req: ProcessRequest, shared_db) -> None:
         total_charts = len(all_charts_info)
         if req.limit_charts:
             all_charts_info = all_charts_info.head(req.limit_charts)
-        exec_time = load_execution_time(filepath)
+        if req.base_date:
+            exec_time = pd.Timestamp(req.base_date) + pd.Timedelta(hours=23, minutes=59, seconds=59)
+        else:
+            exec_time = None
         _upd({"progress": 10})
 
         # 為此 task 建立獨立的圖片輸出資料夾，避免多工時路徑衝突
@@ -1541,6 +1574,28 @@ def get_process_status(task_id: str) -> Dict[str, Any]:
     if task is None:
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
     return task
+
+@app.get("/debug/task/{task_id}/chart_data")
+def debug_chart_data(task_id: str, idx: int = 0) -> Dict[str, Any]:
+    """Debug endpoint: 回傳指定 task 第 idx 筆結果的 chart_data 狀態。"""
+    task = task_status_db.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+    result = task.get("result", {})
+    results = result.get("results", [])
+    if not results:
+        return {"error": "no results", "task_status": task.get("status"), "keys_in_result": list(result.keys())}
+    item = results[idx] if idx < len(results) else results[0]
+    cd = item.get("chart_data")
+    return {
+        "total_results": len(results),
+        "item_keys": list(item.keys()),
+        "chart_data_present": cd is not None,
+        "chart_data_type": str(type(cd)),
+        "chart_data_length": len(cd) if isinstance(cd, list) else None,
+        "chart_data_first_record": cd[0] if isinstance(cd, list) and cd else None,
+        "chart_path": item.get("chart_path"),
+    }
 
 @app.post("/tool-matching")
 def analyze_tool_matching(request: ToolMatchingRequest) -> Dict[str, Any]:

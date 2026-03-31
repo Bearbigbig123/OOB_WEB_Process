@@ -108,6 +108,32 @@ set OOB_PASS=your_password
 └── temp_uploads/                    # 暫存上傳檔案
 ```
 
+## 分析基準日（base_date）
+
+UI 左側提供「**分析基準日**」日期選擇器，所有分析功能均以此日期為時間基準。
+
+| 功能 | 欄位名稱 | 基準日用途 |
+|------|---------|-----------|
+| OOB / SPC 分析 | `base_date` | 轉為當天 `23:59:59` 作為**當週結束時間**（`weekly_end_date`），往前推 6 天為當週範圍；基線為往前一年（可自動擴展至兩年） |
+| Tool Matching | `base_date` | 作為資料視窗的**結束點**，搭配 `filter_mode: "specified_date"` 進行 1M / 6M 回溯篩選 |
+| CPK Dashboard | `end_date` | 作為 CPK 計算視窗的**結束點**，往前計算 L1（1 個月）、L2（2 個月） |
+
+> **注意**：舊版透過 `All_Chart_Information.xlsx` 的 `Time` Sheet 讀取 `execTime` 的邏輯已移除，現在統一由 UI 傳入 `base_date` 決定時間基準。
+
+## 分析資料門檻
+
+### OOB / SPC
+
+| 條件 | 行為 |
+|------|------|
+| 當週資料 = 0 筆 | 整張圖跳過，不輸出任何結果 |
+| 基線（近 1 年）< 10 筆 | 自動擴展至 2 年重新計算 |
+| 擴展後仍 < 10 筆 | OOB 規則全部輸出 `NO_HIGHLIGHT`，圖表仍產生 |
+| K-shift 當週 < 1 筆 | 回傳 `NO_HIGHLIGHT` |
+| K-shift 當週 = 1 筆 | 從基線借點，湊不到 5 筆則回傳 `NO_HIGHLIGHT` |
+| Sticking Rate 當週 < 10 筆 | 向基線借 10–20 筆合併後計算 |
+| category_LT_shift 當週 < 20 筆 | 從基線補足至 20 筆後計算 |
+
 ## API 端點
 
 - `GET /health` - 服務健康檢查
@@ -116,4 +142,4 @@ set OOB_PASS=your_password
 - `POST /split` - CSV 檔案分割
 - `POST /tool-matching` - Tool Matching 分析
 - `POST /spc-cpk` - SPC CPK Dashboard 分析
-"# OOB_WEB_Process" 
+
