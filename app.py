@@ -246,6 +246,7 @@ if 'trigger_analysis' not in st.session_state: st.session_state.trigger_analysis
 if 'pending_endpoint' not in st.session_state: st.session_state.pending_endpoint = None
 if 'logged_in' not in st.session_state: st.session_state.logged_in = False
 if 'login_user' not in st.session_state: st.session_state.login_user = ""
+if 'poll_count' not in st.session_state: st.session_state.poll_count = 0
 # 跨功能切換時保留上傳檔案路徑（Streamlit rerun 會清空 file_uploader）
 if 'saved_excel_path' not in st.session_state: st.session_state.saved_excel_path = None
 if 'saved_raw_dir' not in st.session_state: st.session_state.saved_raw_dir = None
@@ -702,6 +703,7 @@ if st.session_state.trigger_analysis:
     st.session_state.trigger_analysis = False
     st.session_state.current_mode = st.session_state.pending_mode
     st.session_state.results = None
+    st.session_state.poll_count = 0
     try:
         resp = requests.post(f"{API_BASE_URL}{st.session_state.pending_endpoint}", json=st.session_state.pending_payload)
         if resp.status_code == 200:
@@ -717,17 +719,32 @@ if st.session_state.trigger_analysis:
 # ==========================================
 # 2. 輪詢進度 (Polling Logic)
 # ==========================================
+_MAX_POLL_COUNT = 1800  # 1800 × 2秒 ≈ 60分鐘上限
+
 if st.session_state.status == "processing" and st.session_state.task_id:
+    # 前端超時保護：超過 _MAX_POLL_COUNT 次輪詢後自動中止
+    if st.session_state.get("poll_count", 0) > _MAX_POLL_COUNT:
+        st.session_state.status = "failed"
+        st.session_state.poll_count = 0
+        if '_last_errors' not in st.session_state:
+            st.session_state['_last_errors'] = {}
+        st.session_state['_last_errors'][st.session_state.task_id] = "前端輪詢超時（>60分鐘），請確認後台是否正常"
+        st.error("分析超時，請確認後台狀態後重新送出")
+        st.rerun()
     try:
         resp = requests.get(f"{API_BASE_URL}/process/status/{st.session_state.task_id}").json()
         st.session_state.progress = resp.get("progress", 0)
         status = resp.get("status")
         if status == "completed":
-            st.session_state.results = resp.get("result")
+            # 狀態字典只有輕量資訊；完整結果從獨立端點讀取（不走 Manager.dict）
+            result_resp = requests.get(f"{API_BASE_URL}/process/result/{st.session_state.task_id}")
+            st.session_state.results = result_resp.json()
+            st.session_state.poll_count = 0
             st.session_state.status = "completed"
             st.rerun()
         elif status == "failed":
             st.session_state.status = "failed"
+            st.session_state.poll_count = 0
             err = resp.get('error', '')
             if err:
                 if '_last_errors' not in st.session_state:
@@ -736,6 +753,7 @@ if st.session_state.status == "processing" and st.session_state.task_id:
                 st.error(f"後端出錯: {err}")
             st.rerun()
         else:
+            st.session_state.poll_count = st.session_state.get("poll_count", 0) + 1
             time.sleep(POLLING_INTERVAL)
             st.rerun()
     except Exception as e:
@@ -796,7 +814,18 @@ if st.session_state.results:
                 if rule_col in display_df.columns:
                     clean_str = display_df[rule_col].astype(str).str.strip().str.upper()
                     display_df.loc[clean_str.isin(normal_keywords), rule_col] = ""
-            
+
+            # --- 無資料 / 點數不足 標示（直接寫入 OOB_Rule，不新增欄位）---
+            if 'OOB_Rule' in display_df.columns:
+                _no_data_mask = pd.Series(False, index=df_processed.index)
+                _insuf_mask   = pd.Series(False, index=df_processed.index)
+                if 'no_data' in df_processed.columns:
+                    _no_data_mask = df_processed['no_data'].fillna(False).astype(bool)
+                if 'baseline_insufficient' in df_processed.columns:
+                    _insuf_mask = df_processed['baseline_insufficient'].fillna(False).astype(bool)
+                display_df.loc[_no_data_mask, 'OOB_Rule'] = "⚠ 無資料"
+                display_df.loc[_insuf_mask & ~_no_data_mask, 'OOB_Rule'] = "⚠ 點數不足"
+
             has_we = (display_df['WE_Rule'] != "") if 'WE_Rule' in display_df.columns else pd.Series(False, index=display_df.index)
             has_oob = (display_df['OOB_Rule'] != "") if 'OOB_Rule' in display_df.columns else pd.Series(False, index=display_df.index)
             has_tm = (display_df['abnormal_type'] != "") if 'abnormal_type' in display_df.columns else pd.Series(False, index=display_df.index)
@@ -885,7 +914,19 @@ if st.session_state.results:
                 )
             
             if item:
-                if st.session_state.current_mode == "OOB/SPC":
+                if item.get('no_data'):
+                    _reason_map = {
+                        'csv_not_found':    '找不到對應的 CSV 檔案',
+                        'csv_read_error':   '無法讀取 CSV',
+                        'empty':            'CSV 存在但無任何資料點',
+                        'preprocess_failed':'欄位缺失或資料全為離群值',
+                    }
+                    _reason = _reason_map.get(item.get('no_data_reason', ''), '未知原因')
+                    st.warning(f"⚠ **此 Chart 無資料可分析**（{_reason}），無圖表可顯示。")
+                elif item.get('baseline_insufficient'):
+                    st.warning("⚠ **基準期點數不足（< 10 筆）**，無法計算 OOB/統計分析。以下圖表僅供資料瀏覽，分析結果均為 N/A。")
+
+                if not item.get('no_data') and st.session_state.current_mode == "OOB/SPC":
                     if item.get('chart_path'):
                         st.markdown(f"**All Data SPC - {item.get('chart_name')}**")
                         chart_data = item.get('chart_data')
@@ -900,6 +941,7 @@ if st.session_state.results:
                                 df_pts['point_val'] = pd.to_numeric(df_pts['point_val'], errors='coerce')
                                 df_pts = df_pts.dropna(subset=['point_val'])
                                 df_pts = df_pts.sort_values('point_time').reset_index(drop=True)
+                                df_pts['_idx'] = df_pts.index  # 等距 x 軸用
 
                                 fig = go.Figure()
 
@@ -907,15 +949,17 @@ if st.session_state.results:
                                 _wk_start = item.get('weekly_start')
                                 _wk_end   = item.get('weekly_end')
                                 if _wk_start and _wk_end and not df_pts.empty:
-                                    _x_min = df_pts['point_time'].iloc[0]
-                                    _x_max = df_pts['point_time'].iloc[-1]
+                                    _before_wk = df_pts[df_pts['point_time'] < _wk_start]
+                                    _after_wk  = df_pts[df_pts['point_time'] > _wk_end]
+                                    _wk_start_idx = (float(_before_wk['_idx'].max()) + 0.5) if not _before_wk.empty else -0.5
+                                    _wk_end_idx   = (float(_after_wk['_idx'].min()) - 0.5) if not _after_wk.empty else (len(df_pts) - 0.5)
                                     fig.add_vrect(
-                                        x0=_x_min, x1=_wk_start,
+                                        x0=-0.5, x1=_wk_start_idx,
                                         fillcolor='rgba(55,114,255,0.08)',
                                         layer='below', line_width=0,
                                     )
                                     fig.add_vrect(
-                                        x0=_wk_start, x1=_x_max,
+                                        x0=_wk_start_idx, x1=_wk_end_idx,
                                         fillcolor='rgba(232,63,111,0.10)',
                                         layer='below', line_width=0,
                                     )
@@ -923,12 +967,13 @@ if st.session_state.results:
                                 # --- 資料線（依 Site 分組上色）---
                                 if 'Matching' in df_pts.columns:
                                     _sites = sorted(df_pts['Matching'].astype(str).unique())
-                                    for _idx, _site in enumerate(_sites):
+                                    for _si, _site in enumerate(_sites):
                                         _grp = df_pts[df_pts['Matching'].astype(str) == _site]
-                                        _color = _SITE_COLORS[_idx % len(_SITE_COLORS)]
+                                        _color = _SITE_COLORS[_si % len(_SITE_COLORS)]
                                         fig.add_trace(go.Scatter(
-                                            x=_grp['point_time'],
+                                            x=_grp['_idx'],
                                             y=_grp['point_val'],
+                                            customdata=_grp['point_time'],
                                             mode='markers+lines',
                                             name=str(_site),
                                             line=dict(width=1.2, color=_color),
@@ -936,21 +981,22 @@ if st.session_state.results:
                                                         line=dict(width=0.5, color='white')),
                                             hovertemplate=(
                                                 '<b>%{fullData.name}</b><br>'
-                                                '時間: %{x}<br>'
+                                                '時間: %{customdata}<br>'
                                                 '數值: %{y:.4g}'
                                                 '<extra></extra>'
                                             ),
                                         ))
                                 else:
                                     fig.add_trace(go.Scatter(
-                                        x=df_pts['point_time'],
+                                        x=df_pts['_idx'],
                                         y=df_pts['point_val'],
+                                        customdata=df_pts['point_time'],
                                         mode='markers+lines',
                                         name='Data',
                                         line=dict(width=1.5, color='#5863F8'),
                                         marker=dict(size=5, color='#5863F8',
                                                     line=dict(width=0.5, color='white')),
-                                        hovertemplate='時間: %{x}<br>數值: %{y:.4g}<extra></extra>',
+                                        hovertemplate='時間: %{customdata}<br>數值: %{y:.4g}<extra></extra>',
                                     ))
 
                                 # --- 控制線 ---
@@ -978,14 +1024,15 @@ if st.session_state.results:
                                     _we1 = _df_wk[_df_wk['point_val'] > _ucl_v]
                                     if not _we1.empty:
                                         fig.add_trace(go.Scatter(
-                                            x=_we1['point_time'], y=_we1['point_val'],
+                                            x=_we1['_idx'], y=_we1['point_val'],
+                                            customdata=_we1['point_time'],
                                             mode='markers', name='WE1 (>UCL)',
                                             marker=dict(symbol='circle-open', size=16,
                                                         color='#E83F6F',
                                                         line=dict(width=2.5, color='#E83F6F')),
                                             hovertemplate=(
                                                 '<b style="color:#E83F6F">⚠ WE1 違規</b><br>'
-                                                '時間: %{x}<br>數值: %{y:.4g}'
+                                                '時間: %{customdata}<br>數值: %{y:.4g}'
                                                 '<extra></extra>'
                                             ),
                                         ))
@@ -995,14 +1042,15 @@ if st.session_state.results:
                                     _we5 = _df_wk[_df_wk['point_val'] < _lcl_v]
                                     if not _we5.empty:
                                         fig.add_trace(go.Scatter(
-                                            x=_we5['point_time'], y=_we5['point_val'],
+                                            x=_we5['_idx'], y=_we5['point_val'],
+                                            customdata=_we5['point_time'],
                                             mode='markers', name='WE5 (<LCL)',
                                             marker=dict(symbol='circle-open', size=16,
                                                         color='#E83F6F',
                                                         line=dict(width=2.5, color='#E83F6F')),
                                             hovertemplate=(
                                                 '<b style="color:#E83F6F">⚠ WE5 違規</b><br>'
-                                                '時間: %{x}<br>數值: %{y:.4g}'
+                                                '時間: %{customdata}<br>數值: %{y:.4g}'
                                                 '<extra></extra>'
                                             ),
                                         ))
@@ -1012,14 +1060,15 @@ if st.session_state.results:
                                     _rh_val = _df_wk['point_val'].max()
                                     _rh_pts = _df_wk[_df_wk['point_val'] == _rh_val]
                                     fig.add_trace(go.Scatter(
-                                        x=_rh_pts['point_time'], y=_rh_pts['point_val'],
+                                        x=_rh_pts['_idx'], y=_rh_pts['point_val'],
+                                        customdata=_rh_pts['point_time'],
                                         mode='markers', name='Record High ★',
                                         marker=dict(symbol='star', size=14,
                                                     color='#FBBF24',
                                                     line=dict(width=1, color='#D97706')),
                                         hovertemplate=(
                                             '<b style="color:#D97706">★ Record High</b><br>'
-                                            '時間: %{x}<br>數值: %{y:.4g}'
+                                            '時間: %{customdata}<br>數值: %{y:.4g}'
                                             '<extra></extra>'
                                         ),
                                     ))
@@ -1029,14 +1078,15 @@ if st.session_state.results:
                                     _rl_val = _df_wk['point_val'].min()
                                     _rl_pts = _df_wk[_df_wk['point_val'] == _rl_val]
                                     fig.add_trace(go.Scatter(
-                                        x=_rl_pts['point_time'], y=_rl_pts['point_val'],
+                                        x=_rl_pts['_idx'], y=_rl_pts['point_val'],
+                                        customdata=_rl_pts['point_time'],
                                         mode='markers', name='Record Low ★',
                                         marker=dict(symbol='star', size=14,
                                                     color='#4CC9F0',
                                                     line=dict(width=1, color='#0284C7')),
                                         hovertemplate=(
                                             '<b style="color:#0284C7">★ Record Low</b><br>'
-                                            '時間: %{x}<br>數值: %{y:.4g}'
+                                            '時間: %{customdata}<br>數值: %{y:.4g}'
                                             '<extra></extra>'
                                         ),
                                     ))
@@ -1099,11 +1149,16 @@ if st.session_state.results:
                                     paper_bgcolor='white',
                                     font=dict(color='#222'),
                                 )
+                                _n_pts  = len(df_pts)
+                                _t_step = max(1, _n_pts // 20)
+                                _t_vals = list(range(0, _n_pts, _t_step))
+                                _t_text = [str(df_pts.at[i, 'point_time'])[:10] for i in _t_vals]
                                 fig.update_xaxes(
                                     showgrid=False, gridcolor='rgba(0,0,0,0.10)',
                                     tickangle=-90,
-                                    tickformat='%Y-%m-%d',
-                                    nticks=20,
+                                    tickmode='array',
+                                    tickvals=_t_vals,
+                                    ticktext=_t_text,
                                     tickfont=dict(size=9, color='#333'),
                                     showline=True, linecolor='rgba(0,0,0,0.30)',
                                     zeroline=False,

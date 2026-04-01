@@ -1817,7 +1817,7 @@ def plot_qq_plot(raw_df, chart_info, output_dir: str = 'output'):
 
     fig, ax = plt.subplots(figsize=(14, 6))
     title = (f"{display_group_name}[{chart_name}][{chart_info.get('Characteristics', '')}]\n"
-             f"Q-Q Plot (常態分佈檢定)")
+             f"Q-Q Plot (Normality Check)")
     ax.set_title(title, loc='left', fontsize=12)
     ax.set_xlabel("Theoretical Quantiles")
     ax.set_ylabel("Sample Quantiles")

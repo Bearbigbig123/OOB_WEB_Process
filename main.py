@@ -14,6 +14,8 @@ import tempfile
 import shutil
 import uuid
 import asyncio
+import threading
+import json
 from datetime import datetime, date, timedelta
 from io import BytesIO
 from typing import List, Optional, Dict, Any, Union
@@ -110,18 +112,33 @@ def update_task_status(task_id: str, updates: dict, db=None):
 
 # 任務超過此時間後即可被清除 (24 小時)
 _TASK_TTL_HOURS = 24
+# Processing 狀態超過此時間視為卡死，watchdog 會強制 kill (2 小時)
+_TASK_PROCESSING_TIMEOUT_HOURS = 2
+
+
+def _result_json_path(task_id: str) -> str:
+    """返回此 task 的結果 JSON 檔案絕對路徑（寫入子進程、讀取主進程）。"""
+    return os.path.abspath(os.path.join("output", task_id, "result.json"))
 
 
 async def _cleanup_expired_tasks() -> None:
-    """每小時執行一次：清除 task_status_db 中已完成/失敗且超過 TTL 的任務。"""
+    """每小時執行一次：清除 task_status_db 中已完成/失敗且超過 TTL 的任務，
+    以及卡在 processing 超過 _TASK_PROCESSING_TIMEOUT_HOURS 的殭屍任務。"""
     while True:
         await asyncio.sleep(3600)  # 每小時清一次
         now = datetime.now()
         expired = [
             tid for tid, t in list(task_status_db.items())
-            if t.get("status") in ("completed", "failed")
-            and t.get("expires_at")
-            and datetime.fromisoformat(t["expires_at"]) <= now
+            if (
+                t.get("status") in ("completed", "failed")
+                and t.get("expires_at")
+                and datetime.fromisoformat(t["expires_at"]) <= now
+            ) or (
+                t.get("status") == "processing"
+                and t.get("created_at")
+                and (now - datetime.strptime(t["created_at"], "%Y-%m-%d %H:%M:%S")).total_seconds()
+                    > _TASK_PROCESSING_TIMEOUT_HOURS * 3600
+            )
         ]
         for tid in expired:
             out_dir = os.path.join("output", tid)
@@ -129,7 +146,7 @@ async def _cleanup_expired_tasks() -> None:
                 shutil.rmtree(out_dir, ignore_errors=True)
             task_status_db.pop(tid, None)
         if expired:
-            print(f"[Cleanup] 清除 {len(expired)} 筆過期任務")
+            print(f"[Cleanup] 清除 {len(expired)} 筆過期任務 (含卡死)")
 
 
 @asynccontextmanager
@@ -185,6 +202,9 @@ class ResultItem(BaseModel):
     HL_record_high_low: Optional[str] = None
     record_high: Optional[bool] = None
     record_low: Optional[bool] = None
+    baseline_insufficient: Optional[bool] = False
+    no_data: Optional[bool] = False
+    no_data_reason: Optional[str] = None
     chart_path: Optional[str] = None
     weekly_chart_path: Optional[str] = None
     by_tool_color_path: Optional[str] = None
@@ -1108,6 +1128,21 @@ def _analyze_tool_matching_with_charts_and_excel(all_charts_info: pd.DataFrame, 
 # ==========================================
 # FastAPI 路由與端點 (Routes)
 # ==========================================
+
+def _watchdog_process(p: Process, task_id: str, timeout_sec: int = _TASK_PROCESSING_TIMEOUT_HOURS * 3600) -> None:
+    """Daemon thread：監控子進程，若超時則強制 kill 並標記任務為 failed。"""
+    p.join(timeout=timeout_sec)
+    if p.is_alive():
+        p.kill()
+        p.join()
+        update_task_status(task_id, {
+            "status": "failed",
+            "error": f"Task killed: timed out after {timeout_sec // 3600}h",
+            "expires_at": (datetime.now() + timedelta(hours=_TASK_TTL_HOURS)).isoformat(),
+        }, db=task_status_db)
+        print(f"[Watchdog] Task {task_id} killed after {timeout_sec}s timeout")
+
+
 @app.post("/split")
 def split_csvs(req: SplitRequest) -> Dict[str, Any]:
     split_id = str(uuid.uuid4())
@@ -1238,26 +1273,35 @@ def _process_single_chart_worker(args):
         group_name = str(chart_info_row_dict.get("GroupName", chart_info_row_dict.get("group_name", "Unknown")))
         chart_name = str(chart_info_row_dict.get("ChartName", chart_info_row_dict.get("chart_name", "Unknown")))
 
+        _minimal = {
+            "group_name": group_name,
+            "chart_name": chart_name,
+            "data_cnt": 0,
+            "WE_Rule": None,
+            "OOB_Rule": None,
+            "no_data": True,
+        }
+
         csv_path = find_matching_file(raw_dir, group_name, chart_name)
         if not csv_path or not os.path.exists(csv_path):
-            return None
+            return {**_minimal, "no_data_reason": "csv_not_found"}
 
         try:
             raw_df = pd.read_csv(csv_path)
         except Exception:
-            return None
+            return {**_minimal, "no_data_reason": "csv_read_error"}
 
         if "point_time" in raw_df.columns:
             raw_df["point_time"] = pd.to_datetime(raw_df["point_time"], errors="coerce")
             raw_df.dropna(subset=["point_time"], inplace=True)
 
         if raw_df.empty:
-            return None
+            return {**_minimal, "no_data_reason": "empty"}
 
         chart_info_row = pd.Series(chart_info_row_dict)
         is_ok, processed_df, updated_chart_info = preprocess_data(chart_info_row, raw_df)
         if not is_ok or processed_df is None or processed_df.empty:
-            return None
+            return {**_minimal, "no_data_reason": "preprocess_failed"}
 
         chart_info = dict(chart_info_row_dict)
         if "Material_no" in chart_info: chart_info["material_no"] = chart_info.pop("Material_no")
@@ -1323,8 +1367,10 @@ def _run_process_task(task_id: str, req: ProcessRequest, shared_db) -> None:
         #     for result in executor.map(_process_single_chart_worker, task_args):
         #         processed_results.append(result)
         processed_results = []
-        for result in map(_process_single_chart_worker, task_args):
+        _total_tasks = len(task_args)
+        for _i, result in enumerate(map(_process_single_chart_worker, task_args)):
             processed_results.append(result)
+            _upd({"progress": 20 + int(70 * (_i + 1) / max(_total_tasks, 1))})
 
         results: List[Dict[str, Any]] = [r for r in processed_results if r is not None]
         skipped = len(processed_results) - len(results)
@@ -1365,11 +1411,17 @@ def _run_process_task(task_id: str, req: ProcessRequest, shared_db) -> None:
             if "Characteristics" in r: r["Characteristics"] = str(r["Characteristics"]) if r["Characteristics"] is not None else None
             result_items.append(ResultItem(**r))
 
+        # 將完整結果序列化寫入 JSON 檔（不走 Manager.dict，避免大量資料反序列化耗 CPU）
+        _result_file = _result_json_path(task_id)
+        os.makedirs(os.path.dirname(_result_file), exist_ok=True)
+        with open(_result_file, "w", encoding="utf-8") as _f:
+            json.dump(ProcessResponse(summary=summary, results=result_items).model_dump(), _f, ensure_ascii=False, default=str)
+
         _upd({
             "status": "completed",
             "progress": 100,
             "excel_output": excel_output,
-            "result": ProcessResponse(summary=summary, results=result_items).model_dump(),
+            "result_json_path": _result_file,
             "completed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "expires_at": (datetime.now() + timedelta(hours=_TASK_TTL_HOURS)).isoformat(),
         })
@@ -1443,9 +1495,14 @@ def _run_tool_matching_task(task_id: str, req: ToolMatchingRequest, shared_db) -
                 ).model_dump())
             except Exception:
                 continue
+        _result_file = _result_json_path(task_id)
+        os.makedirs(os.path.dirname(_result_file), exist_ok=True)
+        with open(_result_file, "w", encoding="utf-8") as _f:
+            json.dump({"summary": analysis_result["summary"], "results": result_items, "excel_output": analysis_result.get("excel_output")}, _f, ensure_ascii=False, default=str)
+
         _upd({
             "status": "completed", "progress": 100,
-            "result": {"summary": analysis_result["summary"], "results": result_items, "excel_output": analysis_result.get("excel_output")},
+            "result_json_path": _result_file,
             "completed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "expires_at": (datetime.now() + timedelta(hours=_TASK_TTL_HOURS)).isoformat(),
         })
@@ -1521,9 +1578,14 @@ def _run_spc_cpk_task(task_id: str, req: SPCCpkRequest, shared_db) -> None:
         }
         _upd({"progress": 90})
         excel_path = cpk_eng._export_spc_cpk_to_excel(chart_result_objs, summary, start_date, end_date) if chart_result_objs else None
+        _result_file = _result_json_path(task_id)
+        os.makedirs(os.path.dirname(_result_file), exist_ok=True)
+        with open(_result_file, "w", encoding="utf-8") as _f:
+            json.dump(SPCCpkResponse(charts=chart_result_objs, summary=summary, excel_path=excel_path).model_dump(), _f, ensure_ascii=False, default=str)
+
         _upd({
             "status": "completed", "progress": 100,
-            "result": SPCCpkResponse(charts=chart_result_objs, summary=summary, excel_path=excel_path).model_dump(),
+            "result_json_path": _result_file,
             "completed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "expires_at": (datetime.now() + timedelta(hours=_TASK_TTL_HOURS)).isoformat(),
         })
@@ -1559,11 +1621,11 @@ def process_charts_api(req: ProcessRequest) -> Dict[str, Any]:
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "completed_at": None,
         "excel_output": None,
-        "result": None,
         "error": None,
     }
     p = Process(target=_run_process_task, args=(task_id, req, task_status_db))
     p.start()
+    threading.Thread(target=_watchdog_process, args=(p, task_id), daemon=True).start()
     return {"task_id": task_id, "status": "processing"}
 
 
@@ -1573,7 +1635,22 @@ def get_process_status(task_id: str) -> Dict[str, Any]:
     task = task_status_db.get(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
-    return task
+    # 回傳輕量狀態（不含大型 result，避免 Manager.dict 反序列化耗 CPU）
+    return {k: v for k, v in task.items() if k != "result"}
+
+@app.get("/process/result/{task_id}")
+def get_process_result(task_id: str) -> Dict[str, Any]:
+    """取得已完成任務的完整分析結果（從磁碟 JSON 讀取，不走 Manager.dict）。"""
+    task = task_status_db.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+    if task.get("status") != "completed":
+        raise HTTPException(status_code=400, detail=f"Task not completed yet: {task.get('status')}")
+    json_path = task.get("result_json_path")
+    if not json_path or not os.path.isfile(json_path):
+        raise HTTPException(status_code=404, detail="Result file not found on disk")
+    with open(json_path, "r", encoding="utf-8") as _f:
+        return json.load(_f)
 
 @app.get("/debug/task/{task_id}/chart_data")
 def debug_chart_data(task_id: str, idx: int = 0) -> Dict[str, Any]:
@@ -1581,7 +1658,11 @@ def debug_chart_data(task_id: str, idx: int = 0) -> Dict[str, Any]:
     task = task_status_db.get(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
-    result = task.get("result", {})
+    json_path = task.get("result_json_path")
+    if not json_path or not os.path.isfile(json_path):
+        return {"error": "result file not found", "task_status": task.get("status")}
+    with open(json_path, "r", encoding="utf-8") as _f:
+        result = json.load(_f)
     results = result.get("results", [])
     if not results:
         return {"error": "no results", "task_status": task.get("status"), "keys_in_result": list(result.keys())}
@@ -1608,9 +1689,10 @@ def analyze_tool_matching(request: ToolMatchingRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=f"Raw data directory not found: {raw_data_directory}")
     task_id = str(uuid.uuid4())
     task_status_db[task_id] = {"task_id": task_id, "status": "processing", "progress": 0,
-                                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "completed_at": None, "result": None, "error": None}
+                                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "completed_at": None, "error": None}
     p = Process(target=_run_tool_matching_task, args=(task_id, request, task_status_db))
     p.start()
+    threading.Thread(target=_watchdog_process, args=(p, task_id), daemon=True).start()
     return {"task_id": task_id, "status": "processing"}
 
 @app.post("/spc-cpk")
@@ -1624,9 +1706,10 @@ def analyze_spc_cpk(request: SPCCpkRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=f"Raw data dir not found: {raw_data_directory}")
     task_id = str(uuid.uuid4())
     task_status_db[task_id] = {"task_id": task_id, "status": "processing", "progress": 0,
-                                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "completed_at": None, "result": None, "error": None}
+                                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "completed_at": None, "error": None}
     p = Process(target=_run_spc_cpk_task, args=(task_id, request, task_status_db))
     p.start()
+    threading.Thread(target=_watchdog_process, args=(p, task_id), daemon=True).start()
     return {"task_id": task_id, "status": "processing"}
 
 @app.get("/health")
