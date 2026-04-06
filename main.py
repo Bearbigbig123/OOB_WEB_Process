@@ -126,27 +126,32 @@ async def _cleanup_expired_tasks() -> None:
     以及卡在 processing 超過 _TASK_PROCESSING_TIMEOUT_HOURS 的殭屍任務。"""
     while True:
         await asyncio.sleep(3600)  # 每小時清一次
-        now = datetime.now()
-        expired = [
-            tid for tid, t in list(task_status_db.items())
-            if (
-                t.get("status") in ("completed", "failed")
-                and t.get("expires_at")
-                and datetime.fromisoformat(t["expires_at"]) <= now
-            ) or (
-                t.get("status") == "processing"
-                and t.get("created_at")
-                and (now - datetime.strptime(t["created_at"], "%Y-%m-%d %H:%M:%S")).total_seconds()
-                    > _TASK_PROCESSING_TIMEOUT_HOURS * 3600
-            )
-        ]
-        for tid in expired:
-            out_dir = os.path.join("output", tid)
-            if os.path.isdir(out_dir):
-                shutil.rmtree(out_dir, ignore_errors=True)
-            task_status_db.pop(tid, None)
-        if expired:
-            print(f"[Cleanup] 清除 {len(expired)} 筆過期任務 (含卡死)")
+        try:
+            now = datetime.now()
+            expired = [
+                tid for tid, t in list(task_status_db.items())
+                if (
+                    t.get("status") in ("completed", "failed")
+                    and t.get("expires_at")
+                    and datetime.fromisoformat(t["expires_at"]) <= now
+                ) or (
+                    t.get("status") == "processing"
+                    and t.get("created_at")
+                    and (now - datetime.strptime(t["created_at"], "%Y-%m-%d %H:%M:%S")).total_seconds()
+                        > _TASK_PROCESSING_TIMEOUT_HOURS * 3600
+                )
+            ]
+            for tid in expired:
+                out_dir = os.path.join("output", tid)
+                if os.path.isdir(out_dir):
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                task_status_db.pop(tid, None)
+            if expired:
+                print(f"[Cleanup] 清除 {len(expired)} 筆過期任務 (含卡死)")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[Cleanup] 清理週期發生例外，跳過此次：{e}")
 
 
 @asynccontextmanager
@@ -154,8 +159,13 @@ async def lifespan(app: FastAPI):
     global task_status_db
     _mgr = Manager()
     task_status_db = _mgr.dict()  # 僅在主進程 lifespan 中初始化一次
-    asyncio.create_task(_cleanup_expired_tasks())
+    _cleanup_task = asyncio.create_task(_cleanup_expired_tasks())
     yield
+    _cleanup_task.cancel()
+    try:
+        await _cleanup_task
+    except asyncio.CancelledError:
+        pass
     _mgr.shutdown()
 
 
@@ -1135,11 +1145,14 @@ def _watchdog_process(p: Process, task_id: str, timeout_sec: int = _TASK_PROCESS
     if p.is_alive():
         p.kill()
         p.join()
-        update_task_status(task_id, {
-            "status": "failed",
-            "error": f"Task killed: timed out after {timeout_sec // 3600}h",
-            "expires_at": (datetime.now() + timedelta(hours=_TASK_TTL_HOURS)).isoformat(),
-        }, db=task_status_db)
+        try:
+            update_task_status(task_id, {
+                "status": "failed",
+                "error": f"Task killed: timed out after {timeout_sec // 3600}h",
+                "expires_at": (datetime.now() + timedelta(hours=_TASK_TTL_HOURS)).isoformat(),
+            }, db=task_status_db)
+        except Exception as e:
+            print(f"[Watchdog] 無法更新任務狀態 (Manager 可能已關閉): {e}")
         print(f"[Watchdog] Task {task_id} killed after {timeout_sec}s timeout")
 
 
@@ -1412,10 +1425,13 @@ def _run_process_task(task_id: str, req: ProcessRequest, shared_db) -> None:
             result_items.append(ResultItem(**r))
 
         # 將完整結果序列化寫入 JSON 檔（不走 Manager.dict，避免大量資料反序列化耗 CPU）
+        # Atomic write：先寫 .tmp 再 rename，防止 watchdog kill 到一半產生損壞 JSON
         _result_file = _result_json_path(task_id)
         os.makedirs(os.path.dirname(_result_file), exist_ok=True)
-        with open(_result_file, "w", encoding="utf-8") as _f:
+        _result_tmp = _result_file + ".tmp"
+        with open(_result_tmp, "w", encoding="utf-8") as _f:
             json.dump(ProcessResponse(summary=summary, results=result_items).model_dump(), _f, ensure_ascii=False, default=str)
+        os.replace(_result_tmp, _result_file)
 
         _upd({
             "status": "completed",
@@ -1497,8 +1513,10 @@ def _run_tool_matching_task(task_id: str, req: ToolMatchingRequest, shared_db) -
                 continue
         _result_file = _result_json_path(task_id)
         os.makedirs(os.path.dirname(_result_file), exist_ok=True)
-        with open(_result_file, "w", encoding="utf-8") as _f:
+        _result_tmp = _result_file + ".tmp"
+        with open(_result_tmp, "w", encoding="utf-8") as _f:
             json.dump({"summary": analysis_result["summary"], "results": result_items, "excel_output": analysis_result.get("excel_output")}, _f, ensure_ascii=False, default=str)
+        os.replace(_result_tmp, _result_file)
 
         _upd({
             "status": "completed", "progress": 100,
@@ -1580,8 +1598,10 @@ def _run_spc_cpk_task(task_id: str, req: SPCCpkRequest, shared_db) -> None:
         excel_path = cpk_eng._export_spc_cpk_to_excel(chart_result_objs, summary, start_date, end_date) if chart_result_objs else None
         _result_file = _result_json_path(task_id)
         os.makedirs(os.path.dirname(_result_file), exist_ok=True)
-        with open(_result_file, "w", encoding="utf-8") as _f:
+        _result_tmp = _result_file + ".tmp"
+        with open(_result_tmp, "w", encoding="utf-8") as _f:
             json.dump(SPCCpkResponse(charts=chart_result_objs, summary=summary, excel_path=excel_path).model_dump(), _f, ensure_ascii=False, default=str)
+        os.replace(_result_tmp, _result_file)
 
         _upd({
             "status": "completed", "progress": 100,
