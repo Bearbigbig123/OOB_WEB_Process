@@ -235,9 +235,14 @@ def preprocess_data(chart_info, raw_df):
         raw_df = format_and_clean_data(raw_df, chart_info)  # 確保這個函數已經是最佳化的
         
         if raw_df.empty:
-            return False, None, None
+            return False, None, None, None
         
         raw_df, chart_info = update_chart_limits(raw_df, chart_info)  # 確保這個函數已經是最佳化的
+
+        # OOS 過濾前保存完整資料供繪圖使用（含 OOS 點以便在圖上標記）
+        tool_cols_pre = [c for c in ['ByTool', 'EQP_id', 'Matching', 'Tool', 'tool_id'] if c in raw_df.columns]
+        full_df = raw_df[['point_val', 'point_time'] + tool_cols_pre].copy()
+
         raw_df = exclude_oos_data(raw_df)
         # 保留機台欄位以供後續 by-tool 繪圖使用
         tool_cols = [c for c in ['ByTool', 'EQP_id', 'Matching', 'Tool', 'tool_id'] if c in raw_df.columns]
@@ -251,13 +256,13 @@ def preprocess_data(chart_info, raw_df):
             'ChartName': 'chart_name'
         })
         
-        return True, raw_df, chart_info
+        return True, raw_df, chart_info, full_df
     except ValueError as ve:
         print(f'Skip chart processing due to missing columns: {ve}')
-        return False, None, None
+        return False, None, None, None
     except Exception as e:
         print(f'Error occurred during preprocessing: {e}')
-        return False, None, None
+        return False, None, None, None
 
 # 優化後的 find_matching_file 函數
 def find_matching_file(directory, group_name, chart_name):
@@ -1628,6 +1633,18 @@ def plot_spc_chart(raw_df, chart_info, weekly_start_date, weekly_end_date, debug
     # === 畫數據線 ===
     plt.plot(x_values, raw_df['point_val'], color='#5863F8', marker='o', linestyle='-')
 
+    # === 標記 OOS 點（超出 USL/LSL 的點用橘色 × 標示）===
+    usl_val = chart_info.get('USL', chart_info.get('UCL'))
+    lsl_val = chart_info.get('LSL', chart_info.get('LCL'))
+    _oos_mask = pd.Series([False] * len(raw_df))
+    if pd.notna(usl_val):
+        _oos_mask = _oos_mask | (raw_df['point_val'] > usl_val)
+    if pd.notna(lsl_val):
+        _oos_mask = _oos_mask | (raw_df['point_val'] < lsl_val)
+    if _oos_mask.any():
+        plt.scatter(x_values[_oos_mask.values], raw_df['point_val'][_oos_mask.values],
+                    marker='x', color='#FF6600', s=120, linewidths=2, zorder=5, label='OOS')
+
     # === 找當週的 index ===
     ws = pd.to_datetime(weekly_start_date)
     we = pd.to_datetime(weekly_end_date)
@@ -1741,6 +1758,18 @@ def plot_weekly_spc_chart(raw_df, chart_info, weekly_start_date, weekly_end_date
 
     # 畫 weekly 的折線（x 軸使用 0..N-1）
     plt.plot(x_values, df_weekly['point_val'].values, color='#5863F8', marker='o', linestyle='-')
+
+    # === 標記 OOS 點（超出 USL/LSL 的點用橘色 × 標示）===
+    _w_usl = chart_info.get('USL', chart_info.get('UCL'))
+    _w_lsl = chart_info.get('LSL', chart_info.get('LCL'))
+    _w_oos = pd.Series([False] * len(df_weekly))
+    if pd.notna(_w_usl):
+        _w_oos = _w_oos | (df_weekly['point_val'].values > _w_usl)
+    if pd.notna(_w_lsl):
+        _w_oos = _w_oos | (df_weekly['point_val'].values < _w_lsl)
+    if _w_oos.any():
+        plt.scatter(x_values[_w_oos.values], df_weekly['point_val'].values[_w_oos.values],
+                    marker='x', color='#FF6600', s=120, linewidths=2, zorder=5, label='OOS')
 
     # 檢查每一個 weekly 點：用 global index (df_weekly.index) 去取 global 的前 idx+1 筆資料來檢查 rules
     violated_points = []  # 收集觸發的點 (pos_in_weekly, global_index, time, value, rules)
@@ -3051,7 +3080,7 @@ class SPCApp(QtWidgets.QMainWindow): # 將 QTabWidget 改為 QMainWindow
                                 raw_df['point_time'] = pd.to_datetime(raw_df['point_time'], errors='coerce', infer_datetime_format=True)
                                 raw_df.dropna(subset=['point_time'], inplace=True)
 
-                            is_successful, processed_df, updated_chart_info = preprocess_data(chart_info, raw_df)
+                            is_successful, processed_df, updated_chart_info, _full_df = preprocess_data(chart_info, raw_df)
 
                             if not is_successful or processed_df is None or processed_df.empty:
                                 print(f"[Info] 圖表 {group_name}/{chart_name} 預處理失敗或資料為空，跳過。")

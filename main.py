@@ -693,14 +693,16 @@ def _process_discrete_chart_api(
         print(f"[Error] Discrete process failed: {e}")
         return None
 
-def _analyze_chart_api(execution_time: Optional[pd.Timestamp], raw_df: pd.DataFrame, chart_info: Dict[str, Any], output_dir: str = 'output') -> Optional[Dict[str, Any]]:
+def _analyze_chart_api(execution_time: Optional[pd.Timestamp], raw_df: pd.DataFrame, chart_info: Dict[str, Any], output_dir: str = 'output', plot_df: Optional[pd.DataFrame] = None) -> Optional[Dict[str, Any]]:
     if "rule_list" not in chart_info or not chart_info.get("rule_list"):
         chart_info["rule_list"] = [rule for rule in ["WE1", "WE2", "WE3", "WE4", "WE5", "WE6", "WE7", "WE8", "WE9", "WE10"] if chart_info.get(rule, "N") == "Y"]
 
     if "point_time" not in raw_df.columns or not pd.api.types.is_datetime64_any_dtype(raw_df["point_time"]):
         return None
 
-    latest_raw_time = raw_df["point_time"].max()
+    # OOS 顯示：繪圖用含 OOS 的完整資料，分析計算仍用過濾後的 raw_df
+    _plot_df = plot_df if (plot_df is not None and not plot_df.empty) else raw_df
+    latest_raw_time = _plot_df["point_time"].max()
     weekly_end_date = latest_raw_time if execution_time is None or pd.isna(execution_time) else execution_time
     if pd.isna(weekly_end_date):
         return None
@@ -718,28 +720,50 @@ def _analyze_chart_api(execution_time: Optional[pd.Timestamp], raw_df: pd.DataFr
         if result:
             result["data_type"] = "continuous"
 
+    # Fallback：若指定的週窗口內無點（result is None），改以資料實際最新時間點為窗口尾端重試
+    # 確保只要 CSV 有點數，就一定能畫出圖
+    if result is None and not raw_df.empty and "point_val" in raw_df.columns:
+        fallback_end = latest_raw_time
+        if not pd.isna(fallback_end) and fallback_end != weekly_end_date:
+            print(f"[Fallback] 指定週窗口無資料，改以資料最新時間 {fallback_end} 為窗口尾端重新分析")
+            fallback_start = fallback_end - pd.Timedelta(days=6)
+            fallback_baseline_end = fallback_start - pd.Timedelta(seconds=1)
+            fallback_baseline_start = fallback_baseline_end - pd.Timedelta(days=365)
+            if data_type == "discrete":
+                result = _process_discrete_chart_api(raw_df, chart_info, fallback_start, fallback_end, fallback_baseline_start, fallback_baseline_end)
+            else:
+                result = process_single_chart(chart_info.copy(), raw_df, fallback_baseline_start, fallback_baseline_end, fallback_start, fallback_end)
+                if result:
+                    result["data_type"] = "continuous"
+            if result is not None:
+                result["no_data_reason"] = "weekly_window_fallback"
+                weekly_start_date = fallback_start
+                weekly_end_date = fallback_end
+                baseline_end_date = fallback_baseline_end
+                initial_baseline_start_date = fallback_baseline_start
+
     if result is None:
         return None
 
-    image_path, violated_rules = plot_spc_chart(raw_df, chart_info, weekly_start_date, weekly_end_date, output_dir=output_dir)
-    weekly_image_path = plot_weekly_spc_chart(raw_df, chart_info, weekly_start_date, weekly_end_date, output_dir=output_dir)
+    image_path, violated_rules = plot_spc_chart(_plot_df, chart_info, weekly_start_date, weekly_end_date, output_dir=output_dir)
+    weekly_image_path = plot_weekly_spc_chart(_plot_df, chart_info, weekly_start_date, weekly_end_date, output_dir=output_dir)
 
-    # --- 修正後的機台偵測邏輯 ---
+    # --- 修正後的機台偵測邏輯（使用含 OOS 的 _plot_df）---
     # 定義所有可能的機台欄位名稱
     possible_tool_cols = ["ByTool", "EQP_id", "Matching", "Tool", "tool_id"]
-    target_tool_col = next((c for c in possible_tool_cols if c in raw_df.columns), None)
+    target_tool_col = next((c for c in possible_tool_cols if c in _plot_df.columns), None)
     
     _has_tool_data = False
     if target_tool_col:
         # 檢查是否有超過一個以上的機台，且排除空值
-        valid_series = raw_df[target_tool_col].dropna().astype(str).str.strip()
+        valid_series = _plot_df[target_tool_col].dropna().astype(str).str.strip()
         valid_series = valid_series[valid_series != ""]
         if valid_series.nunique() > 1:
             _has_tool_data = True
 
     if _has_tool_data:
-        # 注意：這裡要把 raw_df 裡的欄位暫時 rename 給 oob_eng 的繪圖函式用
-        temp_df = raw_df.rename(columns={target_tool_col: "ByTool"})
+        # 注意：這裡要把 _plot_df 裡的欄位暫時 rename 給 oob_eng 的繪圖函式用
+        temp_df = _plot_df.rename(columns={target_tool_col: "ByTool"})
         try: result["by_tool_color_path"] = plot_spc_by_tool_color(temp_df, chart_info, weekly_start_date, weekly_end_date, output_dir=output_dir)
         except Exception: result["by_tool_color_path"] = None
         try: result["by_tool_group_path"] = plot_spc_by_tool_group(temp_df, chart_info, output_dir=output_dir)
@@ -753,30 +777,36 @@ def _analyze_chart_api(execution_time: Optional[pd.Timestamp], raw_df: pd.DataFr
     result["Cpk"] = cpk.get("Cpk", np.nan) if cpk else np.nan
 
     try:
-        qq_plot_path = plot_qq_plot(raw_df, chart_info, output_dir=output_dir)
+        qq_plot_path = plot_qq_plot(_plot_df, chart_info, output_dir=output_dir)
     except Exception:
         qq_plot_path = None
 
-    # 序列化 chart_data 供 UI Plotly hover 使用 (All Data SPC)
+    # 序列化 chart_data 供 UI Plotly hover 使用 (All Data SPC，含 OOS 點)
     result["weekly_start"] = str(weekly_start_date)
     result["weekly_end"]   = str(weekly_end_date)
     try:
         _possible_site_cols = ["Matching", "ByTool", "EQP_id", "Tool", "tool_id", "Vendor_Site"]
-        _site_col = next((c for c in _possible_site_cols if c in raw_df.columns), None)
-        _plot_cols = ["point_time", "point_val"]
+        _site_col = next((c for c in _possible_site_cols if c in _plot_df.columns), None)
+        _cd_cols = ["point_time", "point_val"]
         if _site_col:
-            _plot_cols.append(_site_col)
-        _plot_df = raw_df[_plot_cols].copy()
-        _plot_df["point_time"] = _plot_df["point_time"].astype(str)
-        _plot_df["point_val"] = pd.to_numeric(_plot_df["point_val"], errors="coerce")
-        _plot_df = _plot_df.dropna(subset=["point_val"])
+            _cd_cols.append(_site_col)
+        _chart_data_df = _plot_df[_cd_cols].copy()
+        _chart_data_df["point_time"] = _chart_data_df["point_time"].astype(str)
+        _chart_data_df["point_val"] = pd.to_numeric(_chart_data_df["point_val"], errors="coerce")
+        _chart_data_df = _chart_data_df.dropna(subset=["point_val"])
         if _site_col:
-            _plot_df = _plot_df.rename(columns={_site_col: "Matching"})
-            _plot_df["Matching"] = _plot_df["Matching"].fillna("Unknown").astype(str)
+            _chart_data_df = _chart_data_df.rename(columns={_site_col: "Matching"})
+            _chart_data_df["Matching"] = _chart_data_df["Matching"].fillna("Unknown").astype(str)
+        # 標記 OOS 點供前端顯示（point_val 在 OOS 過濾後的 raw_df 中不存在）
+        if plot_df is not None and not plot_df.empty:
+            filtered_times = set(raw_df["point_time"].astype(str))
+            _chart_data_df["is_oos"] = ~_chart_data_df["point_time"].isin(filtered_times)
+        else:
+            _chart_data_df["is_oos"] = False
         # 確保所有值都是 Python 原生型別（避免 numpy 型別造成 JSON 序列化問題）
         result["chart_data"] = [
-            {k: (float(v) if hasattr(v, "item") else v) for k, v in row.items()}
-            for row in _plot_df.to_dict(orient="records")
+            {k: (float(v) if hasattr(v, "item") else (bool(v) if isinstance(v, (bool, np.bool_)) else v)) for k, v in row.items()}
+            for row in _chart_data_df.to_dict(orient="records")
         ]
     except Exception:
         result["chart_data"] = []
@@ -1312,7 +1342,7 @@ def _process_single_chart_worker(args):
             return {**_minimal, "no_data_reason": "empty"}
 
         chart_info_row = pd.Series(chart_info_row_dict)
-        is_ok, processed_df, updated_chart_info = preprocess_data(chart_info_row, raw_df)
+        is_ok, processed_df, updated_chart_info, full_df = preprocess_data(chart_info_row, raw_df)
         if not is_ok or processed_df is None or processed_df.empty:
             return {**_minimal, "no_data_reason": "preprocess_failed"}
 
@@ -1322,7 +1352,7 @@ def _process_single_chart_worker(args):
         if "ChartName" in chart_info: chart_info["chart_name"] = chart_info.pop("ChartName")
         chart_info.update(updated_chart_info.to_dict() if hasattr(updated_chart_info, "to_dict") else dict(updated_chart_info))
 
-        return _analyze_chart_api(exec_time, processed_df, chart_info, output_dir=task_output_dir)
+        return _analyze_chart_api(exec_time, processed_df, chart_info, output_dir=task_output_dir, plot_df=full_df)
     except Exception:
         return None
 
