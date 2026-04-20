@@ -1288,12 +1288,6 @@ class ToolMatchingWidget(QtWidgets.QWidget):
 
     def _show_details_dialog(self, chart_key, group_id):
         """彈出一個視窗，顯示詳細資訊和圖表，上方為數據，下方為圖表。"""
-        try:
-            from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-        except ImportError:
-            QtWidgets.QMessageBox.warning(self, "Missing Package", "Matplotlib is required to display charts.")
-            return
-
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle(f"Detailed Information: {chart_key[0]} - {chart_key[1]} | Group: {group_id}")
         dialog.setMinimumSize(1400, 450) # 調整視窗大小以適應新佈局 (高度減少)
@@ -1396,24 +1390,29 @@ class ToolMatchingWidget(QtWidgets.QWidget):
         charts_container_widget = QtWidgets.QWidget()
         charts_layout = QtWidgets.QHBoxLayout(charts_container_widget)
 
-        if hasattr(self, 'chart_figures') and chart_key in self.chart_figures:
-            figures = self.chart_figures[chart_key]
+        site_key = (chart_key[0], chart_key[1], str(group_id))
+        if hasattr(self, 'chart_figures') and site_key in self.chart_figures:
+            figures = self.chart_figures[site_key]
             
             if figures['scatter'] and figures['box']:
-                # --- 解決圖表重複開啟變大問題 ---
-                # 使用 pickle 進行深度複製，確保每次顯示都是全新的 Figure 物件
-                scatter_fig_copy = pickle.loads(pickle.dumps(figures['scatter']))
-                box_fig_copy = pickle.loads(pickle.dumps(figures['box']))
+                scatter_pixmap = QtGui.QPixmap()
+                scatter_pixmap.loadFromData(figures['scatter'])
+                scatter_label = QtWidgets.QLabel()
+                scatter_label.setPixmap(scatter_pixmap)
+                scatter_label.setScaledContents(True)
+                scatter_label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
+                scatter_label.setMinimumSize(300, 200)
 
-                scatter_canvas = FigureCanvas(scatter_fig_copy)
-                box_canvas = FigureCanvas(box_fig_copy)
-                # ------------------------------------
-                
-                scatter_canvas.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
-                box_canvas.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
+                box_pixmap = QtGui.QPixmap()
+                box_pixmap.loadFromData(figures['box'])
+                box_label = QtWidgets.QLabel()
+                box_label.setPixmap(box_pixmap)
+                box_label.setScaledContents(True)
+                box_label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
+                box_label.setMinimumSize(300, 200)
 
-                charts_layout.addWidget(scatter_canvas)
-                charts_layout.addWidget(box_canvas)
+                charts_layout.addWidget(scatter_label)
+                charts_layout.addWidget(box_label)
             else:
                 charts_layout.addWidget(QtWidgets.QLabel("This item's chart was not generated due to insufficient data."))
         else:
@@ -1435,122 +1434,121 @@ class ToolMatchingWidget(QtWidgets.QWidget):
     def _create_boxplots(self, grouped):
         """創建 SPC 圖和盒鬚圖，將 figure 物件保存在 self.chart_figures 中，不在 UI 上顯示。"""
         try:
-            # 這些導入是必要的，因為 Matplotlib 在子線程或不同上下文中可能需要重新導入
-            import matplotlib.pyplot as plt
+            # 使用 Figure() 直接建立，不透過 pyplot 管理，避免 plt.close() 後物件狀態異常
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_agg import FigureCanvasAgg
             from matplotlib import cm
             import numpy as np
+            from io import BytesIO
         except ImportError:
             print("[ERROR] Matplotlib is not installed.")
             return
 
         # 保存圖表與分組鍵的對應關係，用於後續的彈出視窗和 Excel 匯出
         self.chart_figures = {}
-        
+
         # 為每個 (GroupName, ChartName) 組合創建圖表
         for (gname, cname), subdf in grouped:
-            # 依 matching_group 字母順序排序
+            # 依 matching_group 字母順序排序（固定左到右順序）
             unique_groups = sorted(subdf["matching_group"].unique(), key=lambda x: str(x))
             labels = [str(mg) for mg in unique_groups]
 
             # 檢查是否有數據可供繪圖
             if subdf.empty or not any(len(grp["point_val"]) > 0 for _, grp in subdf.groupby("matching_group")):
                 print(f"[WARNING] Skipping chart creation for {gname} - {cname} due to empty data.")
-                self.chart_figures[(gname, cname)] = {'scatter': None, 'box': None}
+                for mg in unique_groups:
+                    self.chart_figures[(gname, cname, str(mg))] = {'scatter': None, 'box': None}
                 continue
 
             # 依排序後 unique_groups 組裝 box_data，確保顏色/label/資料一致
             box_data = [subdf[subdf["matching_group"] == mg]["point_val"].values for mg in unique_groups]
             group_stats = subdf.groupby("matching_group")["point_val"].agg(['mean', 'std', 'count'])
 
-            # 為不同的組設置顏色
+            # 為不同的組設置顏色（固定顏色對應，不隨 focus 改變）
             colors = cm.tab10(np.linspace(0, 1, len(unique_groups)))
 
-            # 1. 創建 SPC 風格的圖表
-            scatter_fig, scatter_ax = plt.subplots(figsize=(7, 4.5)) # 調整尺寸為較小的長方形
-            
-            # 計算整體統計量用於控制線
-            all_values = subdf["point_val"].values
-            # overall_mean = np.mean(all_values)
-            # overall_std = np.std(all_values)
-            
+            # 為每個 site 建立一組 per-site focus 圖
+            # focus site：實心 + 正常大小；其他 site：同色但高度透明
+            for focus_site in unique_groups:
+                # 1. SPC 圖（使用獨立 Figure，不透過 pyplot 管理）
+                scatter_fig = Figure(figsize=(7, 4.5))
+                scatter_ax = scatter_fig.add_subplot(111)
 
-            # 為每個群組繪製數據點，按時間順序連線
-            x_position = 0
-            for i, mg in enumerate(unique_groups):
-                group_data = subdf[subdf["matching_group"] == mg].sort_values("point_time")
-                if not group_data.empty:
-                    # 為每個群組創建連續的x位置
-                    x_vals = np.arange(x_position, x_position + len(group_data))
-                    y_vals = group_data["point_val"].values
-                    
-                    # 繪製數據點
-                    scatter_ax.scatter(x_vals, y_vals, color=colors[i], alpha=0.8, s=40, label=f'{mg}', zorder=3)
-                    
-                    # 連接同組內的點
-                    scatter_ax.plot(x_vals, y_vals, color=colors[i], alpha=0.5, linewidth=1, zorder=2)
-                    
-                    # 在群組間添加分隔線
-                    if i < len(unique_groups) - 1:  # 不在最後一組後面加線
-                        separator_x = x_position + len(group_data) - 0.5
-                        scatter_ax.axvline(x=separator_x, color='gray', linestyle='-', alpha=0.3, zorder=1)
-                    
-                    x_position += len(group_data)
-            
-            # 設置圖表樣式
-            scatter_ax.set_title(f"SPC Chart: {gname} - {cname}", fontsize=10)
-            scatter_ax.set_xlabel("Sample Sequence (Grouped by Matching Group)")
-            scatter_ax.set_ylabel("Point Value")
-            scatter_ax.grid(True, linestyle='--', alpha=0.3, zorder=0)
-            
-            # 添加群組標籤在x軸上
-            if unique_groups:
+                x_position = 0
                 group_positions = []
                 x_pos = 0
-                for mg in unique_groups:
+                for i, mg in enumerate(unique_groups):
+                    group_data = subdf[subdf["matching_group"] == mg].sort_values("point_time")
                     group_size = len(subdf[subdf["matching_group"] == mg])
-                    group_positions.append(x_pos + group_size/2 - 0.5)
+                    group_positions.append(x_pos + group_size / 2 - 0.5)
                     x_pos += group_size
-                
-                # 設置x軸刻度和標籤
+
+                    if not group_data.empty:
+                        x_vals = np.arange(x_position, x_position + len(group_data))
+                        y_vals = group_data["point_val"].values
+
+                        is_focus = str(mg) == str(focus_site)
+                        pt_alpha = 0.95 if is_focus else 0.18
+                        pt_size  = 55  if is_focus else 25
+                        ln_alpha = 0.6 if is_focus else 0.1
+                        ln_width = 1.5 if is_focus else 0.7
+
+                        scatter_ax.scatter(x_vals, y_vals, color=colors[i],
+                                           alpha=pt_alpha, s=pt_size, label=f'{mg}', zorder=3)
+                        scatter_ax.plot(x_vals, y_vals, color=colors[i],
+                                        alpha=ln_alpha, linewidth=ln_width, zorder=2)
+
+                        if i < len(unique_groups) - 1:
+                            separator_x = x_position + len(group_data) - 0.5
+                            scatter_ax.axvline(x=separator_x, color='gray',
+                                               linestyle='-', alpha=0.3, zorder=1)
+
+                        x_position += len(group_data)
+
+                scatter_ax.set_title(f"SPC Chart: {gname} - {cname}  [Focus: {focus_site}]", fontsize=10)
+                scatter_ax.set_xlabel("Sample Sequence (Grouped by Matching Group)")
+                scatter_ax.set_ylabel("Point Value")
+                scatter_ax.grid(True, linestyle='--', alpha=0.3, zorder=0)
                 scatter_ax.set_xticks(group_positions)
                 scatter_ax.set_xticklabels(labels, rotation=0, ha='center')
-                
-                # 添加次要刻度顯示樣本序號
-                scatter_ax.tick_params(axis='x', which='minor', bottom=True, top=False)
-            
-            # 調整圖例位置
-            scatter_ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1), fontsize='small')
-            scatter_fig.tight_layout()
+                scatter_ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1), fontsize='small')
+                scatter_fig.tight_layout()
 
-            # 2. 創建盒鬚圖
-            box_fig, box_ax = plt.subplots(figsize=(7, 4.5)) # 調整尺寸為較小的長方形
-            if box_data:
-                bp = box_ax.boxplot(box_data, labels=labels, patch_artist=True, widths=0.6)
-                for patch, color in zip(bp['boxes'], colors):
-                    patch.set_facecolor(color)
+                # 2. 盒鬚圖（focus site 實心，其他同色但透明）
+                box_fig = Figure(figsize=(7, 4.5))
+                box_ax = box_fig.add_subplot(111)
+                if box_data:
+                    bp = box_ax.boxplot(box_data, labels=labels, patch_artist=True, widths=0.6)
+                    for patch, color, mg in zip(bp['boxes'], colors, unique_groups):
+                        is_focus = str(mg) == str(focus_site)
+                        patch.set_facecolor(color)
+                        patch.set_alpha(0.95 if is_focus else 0.18)
 
-                # legend 也照 unique_groups 順序
-                legend_labels = [
-                    f"{label}: μ={group_stats.loc[mg, 'mean']:.2f}, σ={group_stats.loc[mg, 'std']:.2f}, n={int(group_stats.loc[mg, 'count'])}"
-                    for label, mg in zip(labels, unique_groups)
-                ]
-                box_ax.legend([bp["boxes"][i] for i in range(len(labels))], legend_labels, loc='upper left', bbox_to_anchor=(1.02, 1), fontsize='small')
+                    legend_labels = [
+                        f"{label}: μ={group_stats.loc[mg, 'mean']:.2f}, σ={group_stats.loc[mg, 'std']:.2f}, n={int(group_stats.loc[mg, 'count'])}"
+                        for label, mg in zip(labels, unique_groups)
+                    ]
+                    box_ax.legend([bp["boxes"][i] for i in range(len(labels))],
+                                  legend_labels, loc='upper left', bbox_to_anchor=(1.02, 1), fontsize='small')
 
-            box_ax.set_title(f"Boxplot: {gname} - {cname}", fontsize=10)
-            box_ax.set_xlabel("Matching Group")
-            box_ax.set_ylabel("Point Value")
-            box_ax.grid(True, linestyle='--', alpha=0.6)
-            box_fig.subplots_adjust(right=0.7)
-            box_fig.tight_layout()
+                box_ax.set_title(f"Boxplot: {gname} - {cname}  [Focus: {focus_site}]", fontsize=10)
+                box_ax.set_xlabel("Matching Group")
+                box_ax.set_ylabel("Point Value")
+                box_ax.grid(True, linestyle='--', alpha=0.6)
+                box_fig.subplots_adjust(right=0.7)
+                box_fig.tight_layout()
 
-            # 保存圖表與分組鍵的映射
-            key = (gname, cname)
-            self.chart_figures[key] = {'scatter': scatter_fig, 'box': box_fig}  # scatter實際上是SPC圖
+                # 立即渲染為 PNG bytes，避免 Figure 物件跨次顯示時狀態污染
+                FigureCanvasAgg(scatter_fig)
+                buf_s = BytesIO()
+                scatter_fig.savefig(buf_s, format='png', bbox_inches='tight', dpi=100)
 
-            # 關鍵：關閉 figure 以釋放記憶體，因為我們已經將其保存在 self.chart_figures 中
-            # FigureCanvas 會在需要時重新繪製它
-            plt.close(scatter_fig)
-            plt.close(box_fig)
+                FigureCanvasAgg(box_fig)
+                buf_b = BytesIO()
+                box_fig.savefig(buf_b, format='png', bbox_inches='tight', dpi=100)
+
+                key = (gname, cname, str(focus_site))
+                self.chart_figures[key] = {'scatter': buf_s.getvalue(), 'box': buf_b.getvalue()}
 
     def _export_to_excel(self, all_results, source_path):
         """將分析結果匯出為 Excel 檔案，並在第一欄嵌入完整的盒鬚圖和散點圖。包含異常類型欄。"""
@@ -1665,17 +1663,18 @@ class ToolMatchingWidget(QtWidgets.QWidget):
                     # 檢查是否資料不足
                     is_data_insufficient = (mean_index == 'Insufficient Data' or sigma_index == 'Insufficient Data' or k_value == 'No Compare')
 
-                    # 嘗試使用完整的SPC圖和盒鬚圖
-                    chart_key = (group_name, chart_name)
+                    # 嘗試使用完整的SPC圖和盒鬚圖（以 group_id 為第三維 key 取得 per-site focus 圖）
+                    chart_key = (group_name, chart_name, group_id)
                     if has_chart_figures and chart_key in self.chart_figures:
                         # 存在完整的分析圖表，使用實際的SPC圖和盒鬚圖
                         chart_data = self.chart_figures[chart_key]
 
                         # 1. 處理SPC圖 (放在第一欄)
                         try:
-                            scatter_fig = chart_data['scatter']
+                            scatter_bytes = chart_data['scatter']
                             temp_scatter_path = os.path.join(temp_dir, f"spc_{group_name}_{chart_name}_{row_idx}.png")
-                            scatter_fig.savefig(temp_scatter_path, format='png', bbox_inches='tight', transparent=True, dpi=100)
+                            with open(temp_scatter_path, 'wb') as _f:
+                                _f.write(scatter_bytes)
                             try:
                                 scatter_img = XLImage(temp_scatter_path)
                                 scatter_img.width = img_display_width
@@ -1694,9 +1693,10 @@ class ToolMatchingWidget(QtWidgets.QWidget):
 
                         # 2. 處理盒鬚圖 (放在第二欄)
                         try:
-                            box_fig = chart_data['box']
+                            box_bytes = chart_data['box']
                             temp_box_path = os.path.join(temp_dir, f"box_{group_name}_{chart_name}_{row_idx}.png")
-                            box_fig.savefig(temp_box_path, format='png', bbox_inches='tight', transparent=True, dpi=100)
+                            with open(temp_box_path, 'wb') as _f:
+                                _f.write(box_bytes)
                             try:
                                 box_img = XLImage(temp_box_path)
                                 box_img.width = img_display_width

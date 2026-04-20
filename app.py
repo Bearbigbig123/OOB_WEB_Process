@@ -513,11 +513,8 @@ def generate_full_excel_with_images(data_list, mode):
     for col_idx, width in col_widths.items():
         worksheet.set_column(col_idx, col_idx, min(width, 40))
 
-    # 凍結首列與圖片欄位
-    if is_oob_mode or is_cpk_mode or is_tm_mode:
-        worksheet.freeze_panes(1, num_img_cols)
-    else:
-        worksheet.freeze_panes(1, 0)
+    # 凍結首列（不凍結欄位）
+    worksheet.freeze_panes(1, 0)
 
     workbook.close()
     if _cpk_tmp_dir and os.path.exists(_cpk_tmp_dir):
@@ -903,13 +900,15 @@ if st.session_state.results:
                 else:
                     sel_dict = selected_rows[0]
                     
-                # 同時支援 OOB (group_name/chart_name) 與 Tool Matching (gname/cname) 欄位
-                g_name = sel_dict.get('group_name') or sel_dict.get('gname') or sel_dict.get('group')
+                # 同時支援 OOB (group_name/chart_name) 與 Tool Matching (gname/cname/group) 欄位
+                g_name = sel_dict.get('group_name') or sel_dict.get('gname')
                 c_name = sel_dict.get('chart_name') or sel_dict.get('cname')
+                site_id = sel_dict.get('group')  # Tool Matching 模式的 site (matching_group)
                 item = next(
                     (x for x in data_list if
-                     (str(x.get('group_name', '')) == str(g_name) or str(x.get('gname', '')) == str(g_name) or str(x.get('group', '')) == str(g_name)) and
-                     (str(x.get('chart_name', '')) == str(c_name) or str(x.get('cname', '')) == str(c_name))),
+                     (str(x.get('group_name', '')) == str(g_name) or str(x.get('gname', '')) == str(g_name)) and
+                     (str(x.get('chart_name', '')) == str(c_name) or str(x.get('cname', '')) == str(c_name)) and
+                     (not site_id or str(x.get('group', '')) == str(site_id))),
                     None
                 )
             

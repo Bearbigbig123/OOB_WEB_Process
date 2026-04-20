@@ -706,7 +706,7 @@ def _analyze_chart_api(execution_time: Optional[pd.Timestamp], raw_df: pd.DataFr
     weekly_end_date = latest_raw_time if execution_time is None or pd.isna(execution_time) else execution_time
     if pd.isna(weekly_end_date):
         return None
-    weekly_start_date = weekly_end_date - pd.Timedelta(days=6)
+    weekly_start_date = weekly_end_date - pd.Timedelta(days=7)
     baseline_end_date = weekly_start_date - pd.Timedelta(seconds=1)
     initial_baseline_start_date = baseline_end_date - pd.Timedelta(days=365)
 
@@ -726,7 +726,7 @@ def _analyze_chart_api(execution_time: Optional[pd.Timestamp], raw_df: pd.DataFr
         fallback_end = latest_raw_time
         if not pd.isna(fallback_end) and fallback_end != weekly_end_date:
             print(f"[Fallback] 指定週窗口無資料，改以資料最新時間 {fallback_end} 為窗口尾端重新分析")
-            fallback_start = fallback_end - pd.Timedelta(days=6)
+            fallback_start = fallback_end - pd.Timedelta(days=7)
             fallback_baseline_end = fallback_start - pd.Timedelta(seconds=1)
             fallback_baseline_start = fallback_baseline_end - pd.Timedelta(days=365)
             if data_type == "discrete":
@@ -817,7 +817,7 @@ def _analyze_chart_api(execution_time: Optional[pd.Timestamp], raw_df: pd.DataFr
 # ==========================================
 # Tool Matching 分析模組 (Tool Matching Logic)
 # ==========================================
-def _create_spc_chart(group_df: pd.DataFrame, group_name: str, chart_name: str):
+def _create_spc_chart(group_df: pd.DataFrame, group_name: str, chart_name: str, focus_group=None):
     from io import BytesIO
     unique_groups = sorted(group_df["matching_group"].unique(), key=lambda x: str(x))
 
@@ -844,8 +844,12 @@ def _create_spc_chart(group_df: pd.DataFrame, group_name: str, chart_name: str):
             if not group_data.empty:
                 x_vals = np.arange(x_position, x_position + len(group_data))
                 y_vals = group_data["point_val"].values
-                ax.scatter(x_vals, y_vals, color=colors[i], alpha=0.8, s=40, label=f'{mg}', zorder=3)
-                ax.plot(x_vals, y_vals, color=colors[i], alpha=0.5, linewidth=1, zorder=2)
+                is_focus = focus_group is None or str(mg) == str(focus_group)
+                pt_color = colors[i]
+                pt_alpha = 0.9 if is_focus else 0.25
+                ln_alpha = 0.5 if is_focus else 0.12
+                ax.scatter(x_vals, y_vals, color=pt_color, alpha=pt_alpha, s=40, label=f'{mg}', zorder=3)
+                ax.plot(x_vals, y_vals, color=pt_color, alpha=ln_alpha, linewidth=1, zorder=2)
 
                 if i < len(unique_groups) - 1:
                     separator_x = x_position + len(group_data) - 0.5
@@ -865,7 +869,7 @@ def _create_spc_chart(group_df: pd.DataFrame, group_name: str, chart_name: str):
 
                 x_position += len(group_data)
 
-        ax.set_title(f"SPC Chart: {group_name} - {chart_name}", fontsize=10)
+        ax.set_title(f"SPC Chart: {group_name} - {chart_name}" + (f"  [Focus: {focus_group}]" if focus_group else ""), fontsize=10)
         ax.grid(True, linestyle='--', alpha=0.3, zorder=0)
         # 最多顯示 15 個 tick，均勻取樣
         max_ticks = 15
@@ -886,8 +890,8 @@ def _create_spc_chart(group_df: pd.DataFrame, group_name: str, chart_name: str):
         plt.close(fig)
 
 
-def _create_timeline_chart(group_df: pd.DataFrame, group_name: str, chart_name: str):
-    """所有 matching_group 混合，依 point_time 排序，各組不同顏色的時序圖。"""
+def _create_timeline_chart(group_df: pd.DataFrame, group_name: str, chart_name: str, focus_group=None):
+    """所有 matching_group 混合，依 point_time 排序，各組不同顏色的時序圖。x 軸用等距索引，避免時間疏密不均。"""
     from io import BytesIO
     import matplotlib.dates as mdates
     if group_df.empty or 'point_time' not in group_df.columns:
@@ -897,25 +901,46 @@ def _create_timeline_chart(group_df: pd.DataFrame, group_name: str, chart_name: 
     try:
         df_sorted = group_df.copy()
         df_sorted['point_time'] = pd.to_datetime(df_sorted['point_time'], errors='coerce')
-        df_sorted = df_sorted.dropna(subset=['point_time']).sort_values('point_time')
+        df_sorted = df_sorted.dropna(subset=['point_time']).sort_values('point_time').reset_index(drop=True)
         if df_sorted.empty:
             return None
 
+        # 等距 x 軸（索引），避免時間間距不一造成視覺誤差
+        x_vals = np.arange(len(df_sorted))
         unique_groups = sorted(group_df["matching_group"].unique(), key=lambda x: str(x))
         colors = cm.tab10(np.linspace(0, 1, len(unique_groups)))
         color_map = {mg: colors[i] for i, mg in enumerate(unique_groups)}
 
-        ax.plot(df_sorted['point_time'].values, df_sorted['point_val'].values,
-                color='lightgray', linewidth=1, zorder=1)
-        for mg in unique_groups:
-            sub = df_sorted[df_sorted['matching_group'] == mg]
-            if not sub.empty:
-                ax.scatter(sub['point_time'].values, sub['point_val'].values,
-                           color=color_map[mg], alpha=0.8, s=40, label=str(mg), zorder=3)
+        # 連接線（灰色底線）
+        ax.plot(x_vals, df_sorted['point_val'].values, color='lightgray', linewidth=1, zorder=1)
 
-        ax.set_title(f"Timeline: {group_name} - {chart_name}", fontsize=10)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-        plt.setp(ax.xaxis.get_majorticklabels(), rotation=90, ha='center')
+        for mg in unique_groups:
+            idx = df_sorted[df_sorted['matching_group'] == mg].index
+            if len(idx) == 0:
+                continue
+            is_focus = focus_group is None or str(mg) == str(focus_group)
+            sc_color = color_map[mg]
+            sc_alpha = 0.9 if is_focus else 0.25
+            ax.scatter(idx, df_sorted.loc[idx, 'point_val'].values,
+                       color=sc_color, alpha=sc_alpha, s=40, label=str(mg), zorder=3)
+
+        # x 軸：等距 tick，顯示日期標籤
+        total = len(df_sorted)
+        max_ticks = 15
+        if total <= max_ticks:
+            tick_idx = list(range(total))
+        else:
+            step = max(1, total // max_ticks)
+            tick_idx = list(range(0, total, step))
+            if tick_idx[-1] != total - 1:
+                tick_idx.append(total - 1)
+        ax.set_xticks(tick_idx)
+        ax.set_xticklabels(
+            [df_sorted['point_time'].iloc[i].strftime('%Y-%m-%d') for i in tick_idx],
+            rotation=90, ha='center', fontsize=8
+        )
+
+        ax.set_title(f"Timeline: {group_name} - {chart_name}" + (f"  [Focus: {focus_group}]" if focus_group else ""), fontsize=10)
         ax.grid(True, linestyle='--', alpha=0.3, zorder=0)
         ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1), fontsize='small')
         plt.tight_layout()
@@ -926,7 +951,7 @@ def _create_timeline_chart(group_df: pd.DataFrame, group_name: str, chart_name: 
     finally:
         plt.close(fig)
 
-def _create_boxplot_chart(group_df: pd.DataFrame, group_name: str, chart_name: str):
+def _create_boxplot_chart(group_df: pd.DataFrame, group_name: str, chart_name: str, focus_group=None):
     from io import BytesIO
     fig, ax = plt.subplots(figsize=(9, 4.5))
     try:
@@ -939,8 +964,10 @@ def _create_boxplot_chart(group_df: pd.DataFrame, group_name: str, chart_name: s
 
         if box_data:
             bp = ax.boxplot(box_data, labels=labels, patch_artist=True, widths=0.6)
-            for patch, color in zip(bp['boxes'], colors):
+            for patch, color, mg in zip(bp['boxes'], colors, unique_groups):
+                is_focus = focus_group is None or str(mg) == str(focus_group)
                 patch.set_facecolor(color)
+                patch.set_alpha(0.95 if is_focus else 0.25)
 
             legend_labels = [
                 f"{label}: μ={group_stats.loc[mg, 'mean']:.2f}, σ={group_stats.loc[mg, 'std']:.2f}, n={int(group_stats.loc[mg, 'count'])}"
@@ -948,7 +975,7 @@ def _create_boxplot_chart(group_df: pd.DataFrame, group_name: str, chart_name: s
             ]
             ax.legend([bp["boxes"][i] for i in range(len(labels))], legend_labels, loc='upper left', bbox_to_anchor=(1.02, 1), fontsize='small')
 
-        ax.set_title(f"Boxplot: {group_name} - {chart_name}", fontsize=10)
+        ax.set_title(f"Boxplot: {group_name} - {chart_name}" + (f"  [Focus: {focus_group}]" if focus_group else ""), fontsize=10)
         ax.grid(True, linestyle='--', alpha=0.6)
         plt.setp(ax.xaxis.get_majorticklabels(), rotation=90, ha='center')
         fig.subplots_adjust(right=0.7)
@@ -1041,7 +1068,7 @@ def _export_tool_matching_to_excel(results_df: pd.DataFrame, chart_bytes: dict, 
                     
                     group_name = str(row_data["GroupName"])
                     chart_name = str(row_data["ChartName"])
-                    chart_key = (group_name, chart_name)
+                    chart_key = (group_name, chart_name, str(row_data["matching_group"]))
                     
                     if chart_key in chart_bytes:
                         try:
@@ -1122,29 +1149,31 @@ def _analyze_tool_matching_with_charts_and_excel(all_charts_info: pd.DataFrame, 
             #     for result in executor.map(_tool_matching_plot_worker, task_args):
             for result in map(_tool_matching_plot_worker, task_args):
                     try:
-                        gname, cname, scatter_b, box_b, timeline_b = result
+                        gname, cname, per_site = result
                         safe_g, safe_c = task_meta.get((gname, cname), (gname, cname))
-                        paths = {}
-                        if scatter_b:
-                            spc_path = os.path.join(output_dir, f"TM_{safe_g}_{safe_c}_spc.png")
-                            with open(spc_path, 'wb') as f:
-                                f.write(scatter_b)
-                            paths['spc'] = os.path.abspath(spc_path)
-                            chart_bytes.setdefault((gname, cname), {})['scatter'] = scatter_b
-                        if box_b:
-                            box_path = os.path.join(output_dir, f"TM_{safe_g}_{safe_c}_box.png")
-                            with open(box_path, 'wb') as f:
-                                f.write(box_b)
-                            paths['box'] = os.path.abspath(box_path)
-                            chart_bytes.setdefault((gname, cname), {})['box'] = box_b
-                        if timeline_b:
-                            tl_path = os.path.join(output_dir, f"TM_{safe_g}_{safe_c}_timeline.png")
-                            with open(tl_path, 'wb') as f:
-                                f.write(timeline_b)
-                            paths['timeline'] = os.path.abspath(tl_path)
-                            chart_bytes.setdefault((gname, cname), {})['timeline'] = timeline_b
-                        if paths:
-                            chart_paths[(gname, cname)] = paths
+                        for site, (scatter_b, box_b, timeline_b) in per_site.items():
+                            safe_site = "".join(c if c.isalnum() or c in "-_" else "_" for c in site)
+                            paths = {}
+                            if scatter_b:
+                                spc_path = os.path.join(output_dir, f"TM_{safe_g}_{safe_c}_{safe_site}_spc.png")
+                                with open(spc_path, 'wb') as f:
+                                    f.write(scatter_b)
+                                paths['spc'] = os.path.abspath(spc_path)
+                                chart_bytes.setdefault((gname, cname, site), {})['scatter'] = scatter_b
+                            if box_b:
+                                box_path = os.path.join(output_dir, f"TM_{safe_g}_{safe_c}_{safe_site}_box.png")
+                                with open(box_path, 'wb') as f:
+                                    f.write(box_b)
+                                paths['box'] = os.path.abspath(box_path)
+                                chart_bytes.setdefault((gname, cname, site), {})['box'] = box_b
+                            if timeline_b:
+                                tl_path = os.path.join(output_dir, f"TM_{safe_g}_{safe_c}_{safe_site}_timeline.png")
+                                with open(tl_path, 'wb') as f:
+                                    f.write(timeline_b)
+                                paths['timeline'] = os.path.abspath(tl_path)
+                                chart_bytes.setdefault((gname, cname, site), {})['timeline'] = timeline_b
+                            if paths:
+                                chart_paths[(gname, cname, site)] = paths
                     except Exception:
                         continue
 
@@ -1228,17 +1257,22 @@ def get_split_status(split_id: Optional[str] = None) -> Dict[str, Any]:
 # /process 背景任務函式
 # ==========================================
 def _tool_matching_plot_worker(args):
-    """頂層 picklable worker：生成單一 (GroupName, ChartName) 的 scatter + boxplot + timeline PNG bytes。"""
+    """頂層 picklable worker：每個 site 各自高亮，生成 per-site 的 scatter + boxplot + timeline PNG bytes。"""
     group_name, chart_name, group_df_records = args
     try:
         import pandas as pd
         group_df = pd.DataFrame(group_df_records)
-        scatter_bytes = _create_spc_chart(group_df, group_name, chart_name)
-        box_bytes = _create_boxplot_chart(group_df, group_name, chart_name)
-        timeline_bytes = _create_timeline_chart(group_df, group_name, chart_name)
-        return (group_name, chart_name, scatter_bytes, box_bytes, timeline_bytes)
+        unique_sites = sorted(group_df['matching_group'].dropna().astype(str).unique(), key=str)
+        per_site = {}
+        for site in unique_sites:
+            per_site[site] = (
+                _create_spc_chart(group_df, group_name, chart_name, focus_group=site),
+                _create_boxplot_chart(group_df, group_name, chart_name, focus_group=site),
+                _create_timeline_chart(group_df, group_name, chart_name, focus_group=site),
+            )
+        return (group_name, chart_name, per_site)
     except Exception:
-        return (group_name, chart_name, None, None, None)
+        return (group_name, chart_name, {})
 
 
 def _spc_cpk_worker(args):
@@ -1515,7 +1549,7 @@ def _run_tool_matching_task(task_id: str, req: ToolMatchingRequest, shared_db) -
                 def _sv(v, d='N/A'): return d if pd.isna(v) else ('Infinite' if isinstance(v, float) and v == float('inf') else ('Negative Infinite' if isinstance(v, float) and v == float('-inf') else v))
                 gname_val = str(row['gname'])
                 cname_val = str(row['cname'])
-                paths = chart_paths.get((gname_val, cname_val), {})
+                paths = chart_paths.get((gname_val, cname_val, str(row['group'])), {})
                 # 判斷是否違反
                 raw_mean = row['mean_index']
                 raw_sigma = row['sigma_index']

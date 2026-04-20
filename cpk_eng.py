@@ -90,6 +90,18 @@ def compute_cpk_windows(raw_df: pd.DataFrame, chart_info: dict, end_time: pd.Tim
         result['Cpk'] = calculate_cpk_dashboard(seg, chart_info)['Cpk']
         result['mean_current'] = seg['point_val'].mean()
         result['sigma_current'] = seg['point_val'].std()
+    else:
+        # 當月無資料時，以最新進點的時間為基準，往前取 1 個月作為 fallback 視窗
+        df_sorted = df.sort_values('point_time')
+        if not df_sorted.empty:
+            latest_time = df_sorted['point_time'].iloc[-1]
+            fallback_start = latest_time - pd.DateOffset(months=1)
+            fallback = df_sorted[(df_sorted['point_time'] > fallback_start) & (df_sorted['point_time'] <= latest_time)]
+            if fallback.empty:
+                fallback = df_sorted  # 若仍為空則使用全部資料
+            result['Cpk'] = calculate_cpk_dashboard(fallback, chart_info)['Cpk']
+            result['mean_current'] = fallback['point_val'].mean()
+            result['sigma_current'] = fallback['point_val'].std()
     if mask2.any():
         seg = df[mask2]
         result['Cpk_last_month'] = calculate_cpk_dashboard(seg, chart_info)['Cpk']
@@ -235,7 +247,8 @@ def _draw_main_spc_chart_api(ax, plot_df, chart_info, start_date, end_date, cust
                     end_time = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
                     windows = [(start_time, end_time, 'Custom', '#dbeafe')]
                 else:
-                    end_sel = pd.to_datetime(end_date) if end_date else pd.Timestamp(tmax)
+                    # 用當天最後一毫秒，確保當天所有時間點都被底色涵蓋（原本用 00:00:00 會漏掉同天的下午資料點）
+                    end_sel = (pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)) if end_date else pd.Timestamp(tmax)
                     if end_sel > pd.Timestamp(tmax): end_sel = pd.Timestamp(tmax)
                     start1 = end_sel - pd.DateOffset(months=1)
                     start2 = end_sel - pd.DateOffset(months=2)
