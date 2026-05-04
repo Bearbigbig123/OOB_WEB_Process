@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QListWidget, QListWidgetItem,
+                             QTreeWidget, QTreeWidgetItem,
                              QLabel, QSplitter, QFrame, QSpinBox, QFileDialog,
                              QDialog, QTabWidget, QTableWidget, QTableWidgetItem,
                              QTextEdit, QComboBox, QMessageBox, QDialogButtonBox,
@@ -13,6 +14,7 @@ from io import StringIO
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 from matplotlib.figure import Figure
+import re
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -48,6 +50,20 @@ QListWidget::item:selected {
     background-color: #EEF2FF; color: #4338CA;
     border-left: 3px solid #6366F1; font-weight: 600; padding-left: 9px;
 }
+QTreeWidget {
+    background-color: #FFFFFF; color: #1E293B;
+    border: 1px solid #E2E8F0; border-radius: 10px;
+    padding: 4px; font-size: 13px; outline: none;
+}
+QTreeWidget::item {
+    padding: 7px 10px; border-radius: 6px; margin: 1px 2px;
+}
+QTreeWidget::item:hover { background-color: #F1F5F9; }
+QTreeWidget::item:selected {
+    background-color: #EEF2FF; color: #4338CA;
+    border-left: 3px solid #6366F1; font-weight: 600;
+}
+QTreeWidget::branch { background: transparent; }
 QFrame#DashboardFrame {
     background-color: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 12px;
 }
@@ -204,7 +220,12 @@ def generate_mock_data(n_before=50, n_after=50, n_wafers=25):
             "context_before": context_before,
             "target": target,
             "context_after": context_after,
-            "base_batches": base_batches
+            "base_batches": base_batches,
+            "all_lots_ordered": (
+                [(f"B{i+1:02d}", "base", b) for i, b in enumerate(context_before)] +
+                [(name, "target", target)] +
+                [(f"B{len(context_before)+1+i:02d}", "base", b) for i, b in enumerate(context_after)]
+            ),
         })
 
     b_mean, b_std = 1.0, 0.02
@@ -249,6 +270,95 @@ def generate_mock_data(n_before=50, n_after=50, n_wafers=25):
 # ==========================================
 # 4b. Raw Data 解析器
 # ==========================================
+def _wide_to_tall(df):
+    """Wide format: LotID, Role, [WaferID], ParamName[_Site_N], ...
+    → Tall format: LotID, Role, Param, WaferID, Site_1, Site_2, ...
+    自動偵測 _Site_N 後綴分組；無後綴則視為單一 Site。
+    """
+    df = df.copy()
+    # normalize fixed column names (case-insensitive)
+    col_lmap = {c.lower(): c for c in df.columns}
+    for std in ("LotID", "Role", "WaferID"):
+        lo = std.lower()
+        if lo in col_lmap and col_lmap[lo] != std:
+            df.rename(columns={col_lmap[lo]: std}, inplace=True)
+
+    # auto-generate WaferID if missing
+    if "WaferID" not in df.columns:
+        df["WaferID"] = (
+            df.groupby("LotID", sort=False).cumcount().add(1)
+             .apply(lambda x: f"W{x:02d}")
+        )
+
+    fixed = {"LotID", "Role", "WaferID"}
+    param_cols = [c for c in df.columns if c not in fixed]
+    if not param_cols:
+        raise ValueError("寬格式找不到任何 Param 欄位")
+
+    site_pat = re.compile(r'^(.+?)_Site_(\d+)$', re.IGNORECASE)
+    param_site_map = {}
+    no_site_cols = []
+
+    for col in param_cols:
+        m = site_pat.match(col)
+        if m:
+            pname, snum = m.group(1), int(m.group(2))
+            param_site_map.setdefault(pname, []).append((snum, col))
+        else:
+            no_site_cols.append(col)
+
+    for pname in param_site_map:
+        param_site_map[pname].sort(key=lambda x: x[0])
+
+    base_cols = ["LotID", "Role", "WaferID"]
+    parts = []
+
+    for pname, site_list in param_site_map.items():
+        src_cols = [src for _, src in site_list]
+        sub = df[base_cols + src_cols].copy()
+        sub.insert(2, "Param", pname)
+        sub.rename(columns={src: f"Site_{i+1}" for i, (_, src) in enumerate(site_list)},
+                   inplace=True)
+        parts.append(sub)
+
+    for col in no_site_cols:
+        sub = df[base_cols + [col]].copy()
+        sub.insert(2, "Param", col)
+        sub.rename(columns={col: "Site_1"}, inplace=True)
+        parts.append(sub)
+
+    if not parts:
+        raise ValueError("寬格式找不到任何 Param 欄位")
+
+    return pd.concat(parts, ignore_index=True)
+
+
+def generate_sample_wide_csv_df():
+    """寬格式示範 DataFrame：LotID/Role/WaferID/N_Vt_Site_1..4/Via_Rc_Site_1..4
+    同一列包含多個 Param，以 _Site_N 區分量測點。
+    """
+    rng = np.random.default_rng(seed=99)
+    n_wafers, n_sites = 10, 4
+    rows = []
+
+    def _add(lot_ids, role, nv_m, nv_s, rc_m, rc_s):
+        for lot_id in lot_ids:
+            for w in range(n_wafers):
+                nv = np.round(rng.normal(nv_m, nv_s, n_sites), 4)
+                rc = np.round(rng.normal(rc_m, rc_s, n_sites), 3)
+                r = {"LotID": lot_id, "Role": role, "WaferID": f"W{w+1:02d}"}
+                for i in range(n_sites):
+                    r[f"N_Vt_Site_{i+1}"] = float(nv[i])
+                for i in range(n_sites):
+                    r[f"Via_Rc_Site_{i+1}"] = float(rc[i])
+                rows.append(r)
+
+    _add([f"BL_{i:03d}" for i in range(1, 6)], "base",   1.000, 0.020, 50.0, 1.5)
+    _add(["TARGET_001"],                         "target", 1.055, 0.022, 50.5, 1.6)
+    _add([f"BL_{i:03d}" for i in range(6, 9)],  "base",   1.000, 0.020, 50.0, 1.5)
+    return pd.DataFrame(rows)
+
+
 def generate_sample_csv_df():
     """產生示範用 DataFrame，格式與 parse_raw_csv() 完全相容，可直接存 CSV 或填入貼上區。
     內容: N_Vt, 5 before + 1 target (偏移 +0.055) + 3 after lots × 10 wafers × 4 sites
@@ -286,6 +396,10 @@ def parse_raw_csv(df, param_tier_overrides=None):
     if param_tier_overrides is None:
         param_tier_overrides = {}
 
+    # 格式自動偵測：若無 Param 欄，視為寬格式（多 Param 橫排）並轉換
+    if not any(c.strip().lower() == "param" for c in df.columns):
+        df = _wide_to_tall(df)
+
     required_cols = {"LotID", "Role", "Param"}
     missing = required_cols - set(df.columns)
     if missing:
@@ -296,15 +410,21 @@ def parse_raw_csv(df, param_tier_overrides=None):
         key=lambda x: int(x.split("_")[1]) if len(x.split("_")) > 1 and x.split("_")[1].isdigit() else 0
     )
     if not site_cols:
-        raise ValueError("找不到 Site_* 欄位（如 Site_1, Site_2 …）")
+        # fallback：無 Site_* 欄時，把剩餘非固定欄視為量測值並重命名為 Site_1, Site_2, ...
+        _fixed_tall = {"LotID", "Role", "Param", "WaferID"}
+        _remaining = [c for c in df.columns if c not in _fixed_tall]
+        if not _remaining:
+            raise ValueError("找不到 Site_* 欄位（如 Site_1, Site_2 …）")
+        df = df.copy()
+        df.rename(columns={c: f"Site_{i+1}" for i, c in enumerate(_remaining)}, inplace=True)
+        site_cols = [f"Site_{i+1}" for i in range(len(_remaining))]
 
     df = df.copy()
     df["Role"]  = df["Role"].str.strip().str.lower()
-    df["Role"]  = df["Role"].replace("base", "before")   # base = before 別名
     df["Param"] = df["Param"].str.strip()
     df["LotID"] = df["LotID"].str.strip()
 
-    bad_roles = set(df["Role"].unique()) - {"before", "target", "after"}
+    bad_roles = set(df["Role"].unique()) - {"before", "base", "target", "after"}
     if bad_roles:
         raise ValueError(f"Role 欄有無效值: {bad_roles}（允許 base / before / after / target）")
 
@@ -314,25 +434,6 @@ def parse_raw_csv(df, param_tier_overrides=None):
             for _, lot_df in role_df.groupby("LotID", sort=False)
         ]
 
-    def _split_base_by_target(param_df):
-        """依原始列順序，把 base lots 以 target 位置為界分成 before / after。
-        多個 target 時，以第一個 target lot 出現的列索引為切割點。
-        """
-        # 取得 target 第一次出現的列索引
-        target_rows = param_df[param_df["Role"] == "target"]
-        if target_rows.empty:
-            return param_df  # 留給後面的錯誤處理
-        first_target_idx = target_rows.index[0]
-
-        def assign_base_role(row):
-            if row["Role"] != "base":
-                return row["Role"]
-            return "before" if row.name < first_target_idx else "after"
-
-        result = param_df.copy()
-        result["Role"] = result.apply(assign_base_role, axis=1)
-        return result
-
     scenarios = []
     for param, param_df in df.groupby("Param", sort=False):
         tier = param_tier_overrides.get(param) or PARAM_TIER_MAP.get(param)
@@ -341,13 +442,14 @@ def parse_raw_csv(df, param_tier_overrides=None):
         if tier not in TIER_CONFIG:
             raise ValueError(f"Tier '{tier}' 不合規，必須為 {list(TIER_CONFIG.keys())}")
 
-        # 若有 base role，依時間順序自動分 before/after
-        if "base" in param_df["Role"].values:
-            param_df = _split_base_by_target(param_df)
+        # 依原始列順序收集所有 lots（保留順序用於顯示）
+        all_lots_raw = []
+        for lot_id, lot_df_g in param_df.groupby("LotID", sort=False):
+            role_v = lot_df_g["Role"].iloc[0]
+            arr = lot_df_g[site_cols].astype(float).values
+            all_lots_raw.append((lot_id, role_v, arr))
 
-        context_before = _lots_to_arrays(param_df[param_df["Role"].isin(["before"])])
-        context_after  = _lots_to_arrays(param_df[param_df["Role"] == "after"])
-        base_batches   = context_before + context_after
+        base_batches = [arr for _, r, arr in all_lots_raw if r != "target"]
         if len(base_batches) < 2:
             raise ValueError(
                 f"Param '{param}' 的 baseline（base/before + after）批次數不足，至少需要 2 批")
@@ -368,20 +470,27 @@ def parse_raw_csv(df, param_tier_overrides=None):
             if abs(lot_z) > LOT_Z_LIMIT:
                 violated.append(("LotZ", lot_z, LOT_Z_LIMIT))
 
+            # 顯示用：原始順序，目標批標記 "target"，其餘標記 "base"
+            all_lots_ordered = [
+                (lid, "target" if lid == target_lot_id else "base", arr)
+                for lid, _, arr in all_lots_raw
+            ]
+
             scenarios.append({
-                "name":           target_lot_id,
-                "risk":           risk,
-                "param":          param,
-                "desc":           "手動匯入",
-                "p50_k":          p50_k,
-                "p95_k":          p95_k,
-                "p05_k":          p05_k,
-                "lot_z":          lot_z,
-                "violated":       violated,
-                "context_before": context_before,
-                "target":         target,
-                "context_after":  context_after,
-                "base_batches":   base_batches,
+                "name":             target_lot_id,
+                "risk":             risk,
+                "param":            param,
+                "desc":             "手動匯入",
+                "p50_k":            p50_k,
+                "p95_k":            p95_k,
+                "p05_k":            p05_k,
+                "lot_z":            lot_z,
+                "violated":         violated,
+                "context_before":   base_batches,
+                "target":           target,
+                "context_after":    [],
+                "base_batches":     base_batches,
+                "all_lots_ordered": all_lots_ordered,
             })
 
     return scenarios
@@ -504,10 +613,14 @@ class RawDataImportDialog(QDialog):
         btn_browse.setFixedWidth(110)
         btn_browse.clicked.connect(self._browse_file)
         browse_row.addWidget(btn_browse)
-        btn_sample_file = QPushButton("📋 產生範例")
-        btn_sample_file.setFixedWidth(110)
+        btn_sample_file = QPushButton("📋 長格式範例")
+        btn_sample_file.setFixedWidth(120)
         btn_sample_file.clicked.connect(self._save_sample)
         browse_row.addWidget(btn_sample_file)
+        btn_sample_wide = QPushButton("📋 寬格式範例")
+        btn_sample_wide.setFixedWidth(120)
+        btn_sample_wide.clicked.connect(self._save_wide_sample)
+        browse_row.addWidget(btn_sample_wide)
         ft_layout.addLayout(browse_row)
 
         self.table_preview = QTableWidget()
@@ -570,17 +683,22 @@ class RawDataImportDialog(QDialog):
         paste_top_row = QHBoxLayout()
         paste_top_row.addWidget(QLabel("將 CSV 內容貼上（含 header 列）："))
         paste_top_row.addStretch()
-        btn_fill = QPushButton("📋 填入範例")
-        btn_fill.setFixedWidth(110)
+        btn_fill = QPushButton("📋 長格式範例")
+        btn_fill.setFixedWidth(120)
         btn_fill.clicked.connect(self._fill_sample_text)
         paste_top_row.addWidget(btn_fill)
+        btn_fill_wide = QPushButton("📋 寬格式範例")
+        btn_fill_wide.setFixedWidth(120)
+        btn_fill_wide.clicked.connect(self._fill_wide_sample_text)
+        paste_top_row.addWidget(btn_fill_wide)
         pt_layout.addLayout(paste_top_row)
         self.txt_paste = QTextEdit()
         self.txt_paste.setPlaceholderText(
-            "LotID,Role,Param,WaferID,Site_1,Site_2,...\n"
-            "LOT001,base,N_Vt,W01,1.01,1.02,...\n"
-            "LOT051,target,N_Vt,W01,1.05,1.06,...\n"
-            "（Role: base / before / after / target；WaferID 選填）"
+            "【長格式】LotID,Role,Param,WaferID,Site_1,Site_2,...\n"
+            "  LOT001,base,N_Vt,W01,1.01,1.02,...\n\n"
+            "【寬格式】LotID,Role,WaferID,N_Vt_Site_1,N_Vt_Site_2,Via_Rc_Site_1,...\n"
+            "  LOT001,base,W01,1.01,1.02,50.1,...\n"
+            "（Param 欄位自動偵測；WaferID 選填）"
         )
         self.txt_paste.setFont(QFont("Consolas", 10))
         pt_layout.addWidget(self.txt_paste)
@@ -716,10 +834,25 @@ class RawDataImportDialog(QDialog):
         self._load_df(df, label=path or "（範例資料）")
 
     def _fill_sample_text(self):
-        """將範例 CSV 文字填入貼上區，使用者可直接修改後解析。"""
+        """將長格式範例 CSV 文字填入貼上區，使用者可直接修改後解析。"""
         df = generate_sample_csv_df()
         self.txt_paste.setPlainText(df.to_csv(index=False))
-        self._set_status("已填入範例資料，可修改後按「解析並預覽」", ok=True)
+        self._set_status("已填入長格式範例，可修改後按「解析並預覽」", ok=True)
+
+    def _fill_wide_sample_text(self):
+        """將寬格式範例 CSV 文字填入貼上區。"""
+        df = generate_sample_wide_csv_df()
+        self.txt_paste.setPlainText(df.to_csv(index=False))
+        self._set_status("已填入寬格式範例（N_Vt × Via_Rc，各 4 Sites），可修改後按「解析並預覽」", ok=True)
+
+    def _save_wide_sample(self):
+        """產生寬格式範例 CSV → 可選儲存路徑，並載入預覽。"""
+        df = generate_sample_wide_csv_df()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "儲存寬格式範例 CSV", "sample_wide_rawdata.csv", "CSV Files (*.csv)")
+        if path:
+            df.to_csv(path, index=False, encoding="utf-8-sig")
+        self._load_df(df, label=path or "（寬格式範例）")
 
     def _apply_table_edits(self):
         """從表格目前內容重建 DataFrame（套用使用者的儲存格修改）。"""
@@ -899,7 +1032,8 @@ class KShiftDashboard(QMainWindow):
         filter_row.addWidget(self.btn_f_pass)
         left_layout.addLayout(filter_row)
 
-        self.batch_list = QListWidget()
+        self.batch_list = QTreeWidget()
+        self.batch_list.setHeaderHidden(True)
         self.batch_list.itemSelectionChanged.connect(self.update_dashboard)
         left_layout.addWidget(self.batch_list)
         splitter.addWidget(left_widget)
@@ -961,17 +1095,48 @@ class KShiftDashboard(QMainWindow):
         show_high = self.btn_f_high.isChecked()
         show_warn = self.btn_f_warn.isChecked()
         show_pass = self.btn_f_pass.isChecked()
+
+        param_groups = {}
         for i, d in enumerate(self.analyzed_data):
-            is_high = "HIGH" in d['risk']
-            is_warn = "POTENTIAL" in d['risk']
-            is_pass = d['risk'] == "PASS"
-            if (is_high and show_high) or (is_warn and show_warn) or (is_pass and show_pass):
+            p = d['param']
+            if p not in param_groups:
+                param_groups[p] = []
+            param_groups[p].append((i, d))
+
+        first_child = None
+        for param, items in param_groups.items():
+            visible = []
+            for i, d in items:
+                is_high = "HIGH" in d['risk']
+                is_warn = "POTENTIAL" in d['risk']
+                is_pass = d['risk'] == "PASS"
+                if (is_high and show_high) or (is_warn and show_warn) or (is_pass and show_pass):
+                    visible.append((i, d))
+            if not visible:
+                continue
+
+            group_item = QTreeWidgetItem(self.batch_list)
+            group_item.setText(0, f"{param}  ({len(visible)})")
+            group_item.setData(0, Qt.ItemDataRole.UserRole, None)
+            group_item.setFlags(group_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            font = group_item.font(0)
+            font.setBold(True)
+            font.setPointSize(12)
+            group_item.setFont(0, font)
+            group_item.setExpanded(True)
+
+            for i, d in visible:
+                is_pass = d['risk'] == "PASS"
+                is_warn = "POTENTIAL" in d['risk']
                 icon = "🟢" if is_pass else ("🟡" if is_warn else "🔴")
-                wi = QListWidgetItem(f"{icon} [{d['param']}] {d['name']}")
-                wi.setData(Qt.ItemDataRole.UserRole, i)
-                self.batch_list.addItem(wi)
-        if self.batch_list.count() > 0:
-            self.batch_list.setCurrentRow(0)
+                child = QTreeWidgetItem(group_item)
+                child.setText(0, f"{icon}  {d['name']}")
+                child.setData(0, Qt.ItemDataRole.UserRole, i)
+                if first_child is None:
+                    first_child = child
+
+        if first_child is not None:
+            self.batch_list.setCurrentItem(first_child)
 
     def export_csv(self):
         if not self.analyzed_data:
@@ -997,17 +1162,26 @@ class KShiftDashboard(QMainWindow):
     def update_dashboard(self):
         item = self.batch_list.currentItem()
         if item is None: return
-        idx = item.data(Qt.ItemDataRole.UserRole)
+        idx = item.data(0, Qt.ItemDataRole.UserRole)
+        if idx is None: return  # 點到群組標題
         data = self.analyzed_data[idx]
-        n_b = len(data['context_before'])
-        n_a = len(data['context_after'])
+
+        # 建立顯示用的有序 lot 清單（含 fallback 相容舊格式）
+        all_lots = data.get("all_lots_ordered") or (
+            [(f"B{i+1:02d}", "base", b) for i, b in enumerate(data['context_before'])] +
+            [(data['name'], "target", data['target'])] +
+            [(f"B{len(data['context_before'])+1+i:02d}", "base", b) for i, b in enumerate(data['context_after'])]
+        )
+        n_lots           = len(all_lots)
+        n_base           = sum(1 for _, r, _ in all_lots if r == "base")
+        target_positions = [x for x, (_, r, _) in enumerate(all_lots) if r == "target"]
 
         color = "#198754" if data['risk'] == "PASS" else ("#FD7E14" if "POTENTIAL" in data['risk'] else "#DC3545")
         self.lbl_title.setText(f"Target Batch: {data['name']}")
         self.lbl_title.setStyleSheet(f"color: {color}; font-size: 17px;")
         _nw = data['target'].shape[0]
         self.lbl_metrics.setText(
-            f"  前 {n_b} 批 ＋ 後 {n_a} 批（共 {n_b+n_a} 批 × {_nw} WM = {(n_b+n_a)*_nw} pts）  |  "
+            f"  Context: {n_base} 批 × {_nw} WM = {n_base*_nw} pts  |  "
             f"K-Shift → P50: {data['p50_k']:+.2f}  P95: {data['p95_k']:+.2f}  P05: {data['p05_k']:+.2f}  |  "
             f"Lot Z: {data['lot_z']:+.2f}"
         )
@@ -1033,84 +1207,77 @@ class KShiftDashboard(QMainWindow):
         self.canvas.ax_wafer.clear()
         self.canvas.ax_dist.clear()
 
-        # --- 底色區域（Target = 紅, Baseline = 藍，畫在最底層）---
-        for ax in [self.canvas.ax_lot, self.canvas.ax_wafer]:
-            ax.axvspan(-0.5, 0.5, alpha=0.13, color='#DC3545', zorder=0)
-            ax.axvspan(-n_b - 0.5, -0.5, alpha=0.06, color='#0D6EFD', zorder=0)
-            if n_a > 0:
-                ax.axvspan(0.5, n_a + 0.5, alpha=0.06, color='#0D6EFD', zorder=0)
+        # --- 底色區域：Target 批 = 紅，ax_lot 用位置索引，ax_wafer 用實際 wafer 展開寬度 ---
+        for tx in target_positions:
+            self.canvas.ax_lot.axvspan(tx - 0.5, tx + 0.5, alpha=0.13, color='#DC3545', zorder=0)
+        for lot_x, (_, role, arr) in enumerate(all_lots):
+            bw = arr.shape[0]
+            bh = max(bw / 2.0, 1.0)
+            hs = (bw - 1) / 2.0 / (bh * 1.1 + 1) + 0.05
+            c  = '#DC3545' if role == "target" else '#0D6EFD'
+            a  = 0.13      if role == "target" else 0.04
+            self.canvas.ax_wafer.axvspan(lot_x - hs, lot_x + hs, alpha=a, color=c, zorder=0)
 
         base_wm  = np.concatenate([b.mean(axis=1) for b in data['base_batches']])
         base_p50 = np.percentile(base_wm, 50)
         base_std = (np.percentile(base_wm, 75) - np.percentile(base_wm, 25)) / 1.349
 
         # --- 上半部：Lot Trend (宏觀趨勢) ---
-        x_before = np.arange(-n_b, 0)
-        y_before = [np.median(b) for b in data['context_before']]
-        x_after = np.arange(1, n_a + 1)
-        y_after = [np.median(b) for b in data['context_after']]
-        
-        self.canvas.ax_lot.plot(x_before, y_before, color='#CED4DA', marker='o', markersize=4, linestyle='-', label='Context Lots')
-        self.canvas.ax_lot.plot(x_after, y_after, color='#CED4DA', marker='o', markersize=4, linestyle='-')
-        self.canvas.ax_lot.plot([0], [np.median(data['target'])], marker='D', color='#DC3545', markersize=8, label='Target Lot')
-        
+        x_all = list(range(n_lots))
+        y_all = [np.median(arr) for _, _, arr in all_lots]
+        self.canvas.ax_lot.plot(x_all, y_all, color='#CED4DA', marker='o', markersize=4, linestyle='-', label='Context Lots')
+        _tgt_added = False
+        for tx in target_positions:
+            self.canvas.ax_lot.plot(
+                tx, np.median(all_lots[tx][2]), marker='D', color='#DC3545', markersize=8, zorder=5,
+                label='Target Lot' if not _tgt_added else '_nolegend_')
+            _tgt_added = True
+
         self.canvas.ax_lot.axhline(base_p50, color='#0D6EFD', linestyle='-', linewidth=2, label='Baseline P50')
         self.canvas.ax_lot.axhline(base_p50 + 3*base_std, color='#FD7E14', linestyle='--', label='±3 Sigma Limits')
         self.canvas.ax_lot.axhline(base_p50 - 3*base_std, color='#FD7E14', linestyle='--')
-        
-        self.canvas.style_ax(self.canvas.ax_lot, f"Macro SPC: Lot to Lot Median Trend（前{n_b}後{n_a}批）", "Batch Timeline (0 = Target)", "Lot Median")
+
+        self.canvas.style_ax(self.canvas.ax_lot, f"Macro SPC: Lot Median Trend（共 {n_lots} 批）", "Lot Index", "Lot Median")
         self.canvas.ax_lot.legend(loc='upper right', fontsize=9)
-        self.canvas.ax_lot.set_xlim(-n_b - 2, n_a + 2)
-        self.canvas.ax_lot.margins(y=0.15)
+        self.canvas.ax_lot.set_xlim(-0.5, n_lots - 0.5)
+        # Y 軸依實際 lot median 資料決定，避免 axhline(±3σ) 在 Ioff 等大散佈 param 時撐爆軸域
+        _y_min, _y_max = min(y_all), max(y_all)
+        _y_pad = (_y_max - _y_min) * 0.2 if _y_max != _y_min else abs(_y_max) * 0.15 or 0.1
+        self.canvas.ax_lot.set_ylim(_y_min - _y_pad, _y_max + _y_pad)
 
         # --- 下半部：全歷史 Wafer & Site 散佈圖 (微觀趨勢) ---
         SITE_COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
                        '#9467bd', '#8c564b', '#e377c2', '#17becf',
                        '#bcbd22', '#aec7e8', '#ffbb78', '#98df8a']
-        n_w = data['target'].shape[0]
-        n_s = data['target'].shape[1]
-        half_w = max(n_w / 2.0, 1.0)
+        n_s       = data['target'].shape[1]
+        total_pts = sum(arr.shape[0] * arr.shape[1] for _, _, arr in all_lots)
 
         for s in range(n_s):
-            X_bg = []
-            Y_bg = []
+            X_base, Y_base = [], []
+            X_tgt,  Y_tgt  = [], []
 
-            # 處理 Before Batches（每批次用自己的張數計算偏移）
-            for b_idx, batch_data in enumerate(data['context_before']):
-                b_x = -n_b + b_idx
-                bw = batch_data.shape[0]
+            for lot_x, (_, role, arr) in enumerate(all_lots):
+                bw = arr.shape[0]
                 bh = max(bw / 2.0, 1.0)
-                w_x_offsets = b_x + (np.arange(bw) - bh / 2) / (bh * 1.1 + 1)
-                X_bg.extend(w_x_offsets)
-                Y_bg.extend(batch_data[:, s])
-
-            # 處理 After Batches（每批次用自己的張數計算偏移）
-            for b_idx, batch_data in enumerate(data['context_after']):
-                b_x = 1 + b_idx
-                bw = batch_data.shape[0]
-                bh = max(bw / 2.0, 1.0)
-                w_x_offsets = b_x + (np.arange(bw) - bh / 2) / (bh * 1.1 + 1)
-                X_bg.extend(w_x_offsets)
-                Y_bg.extend(batch_data[:, s])
+                w_x = lot_x + (np.arange(bw) - (bw - 1) / 2.0) / (bh * 1.1 + 1)
+                if role == "target":
+                    X_tgt.extend(w_x);  Y_tgt.extend(arr[:, s])
+                else:
+                    X_base.extend(w_x); Y_base.extend(arr[:, s])
 
             sc = SITE_COLORS[s % len(SITE_COLORS)]
-            # 1. 畫出背景所有的 Site 點 (低透明度，小點)
-            self.canvas.ax_wafer.scatter(X_bg, Y_bg, color=sc, s=6, alpha=0.20, edgecolors='none')
-
-            # 2. 畫出 Target Batch 的 Site 點 (不透明，大點加白邊，並加入圖例)
-            target_x = 0 + (np.arange(n_w) - half_w / 2) / (half_w * 1.1 + 1)
-            self.canvas.ax_wafer.scatter(target_x, data['target'][:, s],
-                                         color=sc, s=40, alpha=0.9,
+            self.canvas.ax_wafer.scatter(X_base, Y_base, color=sc, s=6, alpha=0.20, edgecolors='none')
+            self.canvas.ax_wafer.scatter(X_tgt, Y_tgt, color=sc, s=40, alpha=0.9,
                                          edgecolor='white', linewidth=0.5, label=f'Site {s+1}')
 
         self.canvas.ax_wafer.axhline(base_p50, color='#0D6EFD', linestyle='-', linewidth=2, alpha=0.6)
         self.canvas.ax_wafer.axhline(base_p50 + 3*base_std, color='#FD7E14', linestyle='--', alpha=0.6)
         self.canvas.ax_wafer.axhline(base_p50 - 3*base_std, color='#FD7E14', linestyle='--', alpha=0.6)
-        
-        self.canvas.style_ax(self.canvas.ax_wafer, f"Micro SPC: All Raw Data ({(n_b+n_a+1)*n_w*n_s:,} pts) by Site", f"Batch Timeline ({n_w} Wafers/Lot)", "Site Measurements")
-        self.canvas.ax_wafer.set_xlim(-n_b - 2, n_a + 2)
+
+        self.canvas.style_ax(self.canvas.ax_wafer, f"Micro SPC: All Raw Data ({total_pts:,} pts) by Site", "Lot Index", "Site Measurements")
+        self.canvas.ax_wafer.set_xlim(-0.5, n_lots - 0.5)
         self.canvas.ax_wafer.margins(y=0.15)
-        
+
         # Site 圖例放外面或設定半透明背景，以免遮擋數據
         self.canvas.ax_wafer.legend(loc='upper right', fontsize=8, ncol=4, framealpha=0.9)
         # --- 右下：分佈疊加圖（Baseline WM vs Target WM，水平直方圖對齊散佈圖 y 軸）---
@@ -1125,6 +1292,9 @@ class KShiftDashboard(QMainWindow):
             base_p50, color='#0D6EFD', linewidth=1.5, linestyle='--')
         self.canvas.ax_dist.axhline(
             float(np.median(target_wm_arr)), color='#DC3545', linewidth=1.5, linestyle='--')
+        # 強制 ax_wafer 先重算自動縮放範圍，再同步給 ax_dist
+        self.canvas.ax_wafer.relim()
+        self.canvas.ax_wafer.autoscale_view()
         self.canvas.ax_dist.set_ylim(self.canvas.ax_wafer.get_ylim())
         self.canvas.ax_dist.set_facecolor('#F8F9FA')
         self.canvas.ax_dist.tick_params(colors='#495057', labelsize=7)
