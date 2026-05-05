@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QLabel, QSplitter, QFrame, QSpinBox, QFileDialog,
                              QDialog, QTabWidget, QTableWidget, QTableWidgetItem,
                              QTextEdit, QComboBox, QMessageBox, QDialogButtonBox,
-                             QHeaderView, QGridLayout, QDoubleSpinBox)
+                             QHeaderView, QGridLayout, QDoubleSpinBox, QProgressDialog)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
 from io import StringIO
@@ -194,11 +194,17 @@ def gen_batch_data(base_mean, base_std, is_exp=False, n_wafers=25):
         sites = np.random.normal(w_means, base_std * 0.2, (n_wafers, n_sites)) + site_bias
         return sites
 
-def generate_mock_data(n_before=50, n_after=50, n_wafers=25):
+def generate_mock_data(n_before=50, n_after=50, n_wafers=25, progress_cb=None):
     np.random.seed(42)
     scenarios = []
+    _total = 10
+    _counter = [0]
 
     def add_scenario(name, tier, param, base_mean, base_std, target, desc, is_exp=False):
+        _counter[0] += 1
+        if progress_cb:
+            progress_cb(int(100 * (_counter[0] - 1) / _total),
+                        f"產生情境 {name}（{_counter[0]}/{_total}）…")
         context_before = [gen_batch_data(base_mean, base_std, is_exp, n_wafers) for _ in range(n_before)]
         context_after  = [gen_batch_data(base_mean, base_std, is_exp, n_wafers) for _ in range(n_after)]
 
@@ -385,7 +391,7 @@ def generate_sample_csv_df():
     return pd.DataFrame(rows)
 
 
-def parse_raw_csv(df, param_tier_overrides=None):
+def parse_raw_csv(df, param_tier_overrides=None, progress_cb=None):
     """將使用者提供的 DataFrame 解析成與 generate_mock_data() 相容的 scenario list。
 
     必要欄位: LotID, Role (base/before/after/target), Param, Site_1 … Site_N
@@ -393,13 +399,20 @@ def parse_raw_csv(df, param_tier_overrides=None):
     Role 說明: base = before 的別名；base + after 合稱 baseline。
     Tier 由 PARAM_TIER_MAP 自動判定；未知 Param 可透過 param_tier_overrides 指定。
     """
+    def _report(val, msg):
+        if progress_cb:
+            progress_cb(val, msg)
+
     if param_tier_overrides is None:
         param_tier_overrides = {}
 
+    _report(3, "正在偵測資料格式…")
     # 格式自動偵測：若無 Param 欄，視為寬格式（多 Param 橫排）並轉換
     if not any(c.strip().lower() == "param" for c in df.columns):
+        _report(8, "轉換寬格式 → 長格式…")
         df = _wide_to_tall(df)
 
+    _report(12, "欄位驗證中…")
     required_cols = {"LotID", "Role", "Param"}
     missing = required_cols - set(df.columns)
     if missing:
@@ -434,6 +447,13 @@ def parse_raw_csv(df, param_tier_overrides=None):
             for _, lot_df in role_df.groupby("LotID", sort=False)
         ]
 
+    _report(18, "統計分析任務數…")
+    _n_tasks = sum(
+        int(grp[grp["Role"] == "target"]["LotID"].nunique())
+        for _, grp in df.groupby("Param", sort=False)
+    )
+    _task_idx = 0
+
     scenarios = []
     for param, param_df in df.groupby("Param", sort=False):
         tier = param_tier_overrides.get(param) or PARAM_TIER_MAP.get(param)
@@ -443,9 +463,9 @@ def parse_raw_csv(df, param_tier_overrides=None):
             raise ValueError(f"Tier '{tier}' 不合規，必須為 {list(TIER_CONFIG.keys())}")
 
         # 依原始列順序收集所有 lots（保留順序用於顯示）
+        # 以 (LotID, Role) 分組：同一 LotID 若同時含 base 和 target，各自獨立進計算
         all_lots_raw = []
-        for lot_id, lot_df_g in param_df.groupby("LotID", sort=False):
-            role_v = lot_df_g["Role"].iloc[0]
+        for (lot_id, role_v), lot_df_g in param_df.groupby(["LotID", "Role"], sort=False):
             arr = lot_df_g[site_cols].astype(float).values
             all_lots_raw.append((lot_id, role_v, arr))
 
@@ -459,6 +479,11 @@ def parse_raw_csv(df, param_tier_overrides=None):
             raise ValueError(f"Param '{param}' 沒有 Role=target 的資料")
 
         for target_lot_id, target_lot_df in target_df.groupby("LotID", sort=False):
+            _task_idx += 1
+            _report(
+                18 + int(80 * _task_idx / max(_n_tasks, 1)),
+                f"計算 K-Shift：{param} / {target_lot_id}（{_task_idx}/{_n_tasks}）…"
+            )
             target = target_lot_df[site_cols].astype(float).values
             risk, p50_k, p95_k, p05_k, violated = calculate_k_shift(base_batches, target, tier)
 
@@ -470,11 +495,8 @@ def parse_raw_csv(df, param_tier_overrides=None):
             if abs(lot_z) > LOT_Z_LIMIT:
                 violated.append(("LotZ", lot_z, LOT_Z_LIMIT))
 
-            # 顯示用：原始順序，目標批標記 "target"，其餘標記 "base"
-            all_lots_ordered = [
-                (lid, "target" if lid == target_lot_id else "base", arr)
-                for lid, _, arr in all_lots_raw
-            ]
+            # 顯示用：直接沿用 all_lots_raw 的 role（已按 LotID+Role 分組，不會互相覆蓋）
+            all_lots_ordered = list(all_lots_raw)
 
             scenarios.append({
                 "name":             target_lot_id,
@@ -493,6 +515,7 @@ def parse_raw_csv(df, param_tier_overrides=None):
                 "all_lots_ordered": all_lots_ordered,
             })
 
+    _report(100, "分析完成！")
     return scenarios
 
 
@@ -713,7 +736,20 @@ class RawDataImportDialog(QDialog):
         self.tier_assign_widget = QWidget()
         ta_layout = QVBoxLayout(self.tier_assign_widget)
         ta_layout.setContentsMargins(0, 4, 0, 4)
-        ta_layout.addWidget(QLabel("⚙️ 以下 Param 未有預設 Tier，請手動指定："))
+        ta_layout.addWidget(QLabel("⚙️ 請確認各 Param 的 Tier（可覆蓋預設值）："))
+        # 統一套用列
+        ta_apply_row = QHBoxLayout()
+        ta_apply_row.addWidget(QLabel("統一套用："))
+        self.combo_apply_all_tier = QComboBox()
+        self.combo_apply_all_tier.addItems(list(TIER_CONFIG.keys()))
+        self.combo_apply_all_tier.setFixedWidth(100)
+        ta_apply_row.addWidget(self.combo_apply_all_tier)
+        btn_apply_all = QPushButton("全部套用")
+        btn_apply_all.setFixedWidth(90)
+        btn_apply_all.clicked.connect(self._apply_all_tiers)
+        ta_apply_row.addWidget(btn_apply_all)
+        ta_apply_row.addStretch()
+        ta_layout.addLayout(ta_apply_row)
         self.tier_assign_grid = QGridLayout()
         ta_layout.addLayout(self.tier_assign_grid)
         self.tier_assign_widget.setVisible(False)
@@ -788,22 +824,41 @@ class RawDataImportDialog(QDialog):
         self._tier_combos.clear()
 
         if "Param" not in df.columns:
+            # 寬格式：從欄位名稱提取 Param 清單
+            _fixed = {s.lower() for s in ("LotID", "Role", "WaferID")}
+            _site_pat = re.compile(r'^(.+?)_Site_(\d+)$', re.IGNORECASE)
+            seen, params_list = set(), []
+            for col in df.columns:
+                if col.lower() in _fixed:
+                    continue
+                m = _site_pat.match(col)
+                pname = m.group(1) if m else col
+                if pname not in seen:
+                    seen.add(pname)
+                    params_list.append(pname)
+            params = params_list
+        else:
+            params = list(df["Param"].str.strip().unique())
+
+        if not params:
             self.tier_assign_widget.setVisible(False)
             return
 
-        params = df["Param"].str.strip().unique()
-        unknown = [p for p in params if p not in PARAM_TIER_MAP]
-        if not unknown:
-            self.tier_assign_widget.setVisible(False)
-            return
-
-        for row_idx, param in enumerate(unknown):
+        for row_idx, param in enumerate(params):
             self.tier_assign_grid.addWidget(QLabel(f"  {param} :"), row_idx, 0)
             combo = QComboBox()
             combo.addItems(list(TIER_CONFIG.keys()))
+            # 已知 Param 預先帶入 PARAM_TIER_MAP 預設值，未知的預設 Tier 1
+            default_tier = PARAM_TIER_MAP.get(param, list(TIER_CONFIG.keys())[0])
+            combo.setCurrentText(default_tier)
             self._tier_combos[param] = combo
             self.tier_assign_grid.addWidget(combo, row_idx, 1)
         self.tier_assign_widget.setVisible(True)
+
+    def _apply_all_tiers(self):
+        tier = self.combo_apply_all_tier.currentText()
+        for combo in self._tier_combos.values():
+            combo.setCurrentText(tier)
 
     def _set_status(self, msg, ok=True):
         self.lbl_status.setText(msg)
@@ -815,10 +870,24 @@ class RawDataImportDialog(QDialog):
                                 "請先載入 CSV/Excel 檔案或貼上文字後再確認。")
             return
         overrides = {p: cb.currentText() for p, cb in self._tier_combos.items()}
+        prog = QProgressDialog("準備中…", None, 0, 100, self)
+        prog.setWindowTitle("資料解析中")
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
+
+        def _cb(value, message):
+            prog.setLabelText(message)
+            prog.setValue(value)
+            QApplication.processEvents()
+
         try:
-            self._scenarios = parse_raw_csv(self._df, overrides)
+            self._scenarios = parse_raw_csv(self._df, overrides, progress_cb=_cb)
+            prog.setValue(100)
+            prog.close()
             self.accept()
         except ValueError as exc:
+            prog.close()
             QMessageBox.critical(self, "資料格式錯誤", str(exc))
 
     def get_scenarios(self):
@@ -1085,7 +1154,20 @@ class KShiftDashboard(QMainWindow):
         SettingsDialog(self).exec()
 
     def run_analysis(self):
-        self.analyzed_data = generate_mock_data(n_wafers=self.spin_wafers.value())
+        prog = QProgressDialog("準備中…", None, 0, 100, self)
+        prog.setWindowTitle("產生模擬資料中")
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
+
+        def _cb(value, message):
+            prog.setLabelText(message)
+            prog.setValue(value)
+            QApplication.processEvents()
+
+        self.analyzed_data = generate_mock_data(n_wafers=self.spin_wafers.value(), progress_cb=_cb)
+        prog.setValue(100)
+        prog.close()
         self.populate_list()
 
     def populate_list(self):
